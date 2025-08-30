@@ -1,0 +1,15 @@
+.DS_Store
+.vscode/
+.idea/
+/bin/
+/vendor/
+/go.mod
+/go.sum
+*.log
+*.pid
+*.out
+/dist/
+/build/
+/release/
+.gitingestignore
+*txt
