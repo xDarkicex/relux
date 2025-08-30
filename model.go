@@ -2,6 +2,7 @@ package relux
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 
 	"github.com/xDarkicex/relux/internal/layer"
@@ -61,13 +62,18 @@ func (n *Network) Fit(X, Y [][]float64, opts ...TrainOption) error {
 		}
 	}
 
-	// Default training config
+	// Enhanced default config with Phase 5 features
 	cfg := trainConfig{
-		epochs:       10,
-		batchSize:    32,
-		learningRate: 0.01,
-		shuffle:      true,
-		verbose:      false, // Added verbose default
+		epochs:        10,
+		batchSize:     32,
+		learningRate:  0.01,
+		shuffle:       true,
+		verbose:       false,
+		momentum:      0.0,  // No momentum by default
+		lrDecay:       1.0,  // No decay by default
+		lrDecaySteps:  1000, // Decay every 1000 epochs
+		earlyStopping: 0,    // No early stopping by default
+		gradClip:      5.0,  // Default gradient clipping
 	}
 
 	// Apply options
@@ -75,10 +81,23 @@ func (n *Network) Fit(X, Y [][]float64, opts ...TrainOption) error {
 		opt(&cfg)
 	}
 
-	// Training loop with verbose monitoring
+	// Early stopping variables
+	bestLoss := math.Inf(1)
+	patience := 0
+	currentLR := cfg.learningRate
+
+	// Enhanced training loop with Phase 5 features
 	for epoch := 0; epoch < cfg.epochs; epoch++ {
 		var totalLoss float64
 		sampleCount := 0
+
+		// Learning rate decay
+		if cfg.lrDecay < 1.0 && epoch > 0 && epoch%cfg.lrDecaySteps == 0 {
+			currentLR *= cfg.lrDecay
+			if cfg.verbose {
+				fmt.Printf("Learning rate decayed to: %.6f\n", currentLR)
+			}
+		}
 
 		// Create indices for shuffling
 		indices := make([]int, len(X))
@@ -110,25 +129,48 @@ func (n *Network) Fit(X, Y [][]float64, opts ...TrainOption) error {
 					out = layer.Forward(out)
 				}
 
-				// Accumulate loss for monitoring
-				if cfg.verbose {
-					loss := n.loss.Forward(out, Y[idx])
-					totalLoss += loss
-					sampleCount++
-				}
+				// Track loss for early stopping and monitoring
+				lossValue := n.loss.Forward(out, Y[idx])
+				totalLoss += lossValue
+				sampleCount++
 
-				// Backward pass
+				// Enhanced backward pass with momentum and gradient clipping
 				grad := n.loss.Backward(out, Y[idx])
 				for j := len(n.layers) - 1; j >= 0; j-- {
-					grad = n.layers[j].Backward(grad, cfg.learningRate)
+					if dense, ok := n.layers[j].(*layer.Dense); ok {
+						grad = dense.BackwardWithMomentum(grad, currentLR, cfg.momentum, cfg.gradClip)
+					} else {
+						grad = n.layers[j].Backward(grad, currentLR)
+					}
 				}
 			}
 		}
 
-		// Verbose logging every 100 epochs or last epoch
+		// Early stopping check
+		if cfg.earlyStopping > 0 {
+			avgLoss := totalLoss / float64(sampleCount)
+			if avgLoss < bestLoss {
+				bestLoss = avgLoss
+				patience = 0
+			} else {
+				patience++
+				if patience >= cfg.earlyStopping {
+					if cfg.verbose {
+						fmt.Printf("Early stopping at epoch %d (best_loss=%.6f)\n", epoch+1, bestLoss)
+					}
+					break
+				}
+			}
+		}
+
+		// Enhanced verbose logging with Phase 5 features
 		if cfg.verbose && ((epoch+1)%100 == 0 || epoch == cfg.epochs-1) {
 			avgLoss := totalLoss / float64(sampleCount)
-			fmt.Printf("Epoch %d/%d: avg_loss=%.6f\n", epoch+1, cfg.epochs, avgLoss)
+			fmt.Printf("Epoch %d/%d: loss=%.6f, lr=%.6f", epoch+1, cfg.epochs, avgLoss, currentLR)
+			if cfg.earlyStopping > 0 {
+				fmt.Printf(", patience=%d/%d", patience, cfg.earlyStopping)
+			}
+			fmt.Println()
 		}
 	}
 

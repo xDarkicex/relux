@@ -11,6 +11,7 @@ import (
 type Layer interface {
 	Forward(x []float64) []float64
 	Backward(gradOut []float64, lr float64) []float64
+	BackwardWithMomentum(gradOut []float64, lr, momentum, gradClip float64) []float64
 }
 
 type Dense struct {
@@ -23,6 +24,10 @@ type Dense struct {
 	// Cache for backprop
 	lastInput []float64
 	lastZ     []float64 // pre-activation values
+
+	// Phase 5: Momentum velocities
+	VW [][]float64 // Weight velocities
+	VB []float64   // Bias velocities
 }
 
 func NewDense(in, out int, a act.Activation, rnd *rand.Rand) *Dense {
@@ -70,6 +75,19 @@ func NewDense(in, out int, a act.Activation, rnd *rand.Rand) *Dense {
 	}
 }
 
+// Initialize momentum velocities
+func (d *Dense) initMomentum() {
+	if d.VW == nil {
+		d.VW = make([][]float64, d.out)
+		for j := 0; j < d.out; j++ {
+			d.VW[j] = make([]float64, d.in)
+		}
+	}
+	if d.VB == nil {
+		d.VB = make([]float64, d.out)
+	}
+}
+
 // OutputSize returns the output dimension of this layer
 func (d *Dense) OutputSize() int {
 	return d.out
@@ -93,38 +111,63 @@ func (d *Dense) Forward(x []float64) []float64 {
 		d.lastZ[j] = sum
 	}
 
-	// Apply activation in-place to a new slice (don't modify lastZ)
-	out := make([]float64, d.out)
-	for i, z := range d.lastZ {
-		out[i] = d.Act.Apply(z)
+	// Apply activation - handle softmax specially
+	if d.Act.Name() == "softmax" {
+		// Import the act package function for proper softmax
+		return act.SoftmaxVec(d.lastZ)
+	} else {
+		// Apply other activations element-wise
+		out := make([]float64, d.out)
+		for i, z := range d.lastZ {
+			out[i] = d.Act.Apply(z)
+		}
+		return out
 	}
-	return out
 }
 
 func (d *Dense) Backward(gradOut []float64, lr float64) []float64 {
-	// Compute gradients w.r.t. pre-activation (z)
-	actDeriv := act.DerivativeVec(d.Act, d.lastZ)
-	gradZ := make([]float64, d.out)
-	for j := 0; j < d.out; j++ {
-		gradZ[j] = gradOut[j] * actDeriv[j]
+	return d.BackwardWithMomentum(gradOut, lr, 0.0, 0.0)
+}
+
+func (d *Dense) BackwardWithMomentum(gradOut []float64, lr, momentum, gradClip float64) []float64 {
+	// Initialize momentum if needed
+	if momentum > 0 {
+		d.initMomentum()
 	}
 
-	// Gradient clipping for stability
-	const maxGradNorm = 5.0
-	gradNorm := 0.0
-	for _, g := range gradZ {
-		gradNorm += g * g
-	}
-	gradNorm = math.Sqrt(gradNorm)
-
-	if gradNorm > maxGradNorm {
-		scale := maxGradNorm / gradNorm
-		for j := range gradZ {
-			gradZ[j] *= scale
+	// Compute gradients w.r.t. pre-activation - handle softmax specially
+	var gradZ []float64
+	if d.Act.Name() == "softmax" {
+		// For softmax, the gradient is already computed correctly in the loss function
+		// when using categorical crossentropy, so we can use gradOut directly
+		gradZ = make([]float64, len(gradOut))
+		copy(gradZ, gradOut)
+	} else {
+		// For other activations, apply chain rule
+		actDeriv := act.DerivativeVec(d.Act, d.lastZ)
+		gradZ = make([]float64, d.out)
+		for j := 0; j < d.out; j++ {
+			gradZ[j] = gradOut[j] * actDeriv[j]
 		}
 	}
 
-	// Compute gradients w.r.t. input (for previous layer)
+	// Rest of the function remains the same...
+	// Gradient clipping
+	if gradClip > 0 {
+		gradNorm := 0.0
+		for _, g := range gradZ {
+			gradNorm += g * g
+		}
+		gradNorm = math.Sqrt(gradNorm)
+		if gradNorm > gradClip {
+			scale := gradClip / gradNorm
+			for j := range gradZ {
+				gradZ[j] *= scale
+			}
+		}
+	}
+
+	// Compute gradients w.r.t. input
 	gradInput := make([]float64, d.in)
 	for j := 0; j < d.out; j++ {
 		for i := 0; i < d.in; i++ {
@@ -132,15 +175,26 @@ func (d *Dense) Backward(gradOut []float64, lr float64) []float64 {
 		}
 	}
 
-	// Update parameters (SGD)
+	// Update parameters with momentum
 	for j := 0; j < d.out; j++ {
 		// Update bias
-		d.B[j] -= lr * gradZ[j]
+		gradB := gradZ[j]
+		if momentum > 0 {
+			d.VB[j] = momentum*d.VB[j] - lr*gradB
+			d.B[j] += d.VB[j]
+		} else {
+			d.B[j] -= lr * gradB
+		}
 
 		// Update weights
 		for i := 0; i < d.in; i++ {
 			gradW := gradZ[j] * d.lastInput[i]
-			d.W[j][i] -= lr * gradW
+			if momentum > 0 {
+				d.VW[j][i] = momentum*d.VW[j][i] - lr*gradW
+				d.W[j][i] += d.VW[j][i]
+			} else {
+				d.W[j][i] -= lr * gradW
+			}
 		}
 	}
 

@@ -31,11 +31,16 @@ type Config struct {
 type TrainOption func(*trainConfig)
 
 type trainConfig struct {
-	epochs       int
-	batchSize    int
-	learningRate float64
-	shuffle      bool
-	verbose      bool // Added verbose field
+	learningRate  float64 // 8
+	momentum      float64 // 8
+	lrDecay       float64 // 8
+	gradClip      float64 // 8
+	epochs        int     // 8
+	batchSize     int     // 8
+	lrDecaySteps  int     // 8
+	earlyStopping int     // 8
+	shuffle       bool    // 1
+	verbose       bool    // 1 + 6 padding verbose training flag
 }
 
 func Epochs(n int) TrainOption {
@@ -74,6 +79,50 @@ func Shuffle(s bool) TrainOption {
 // Added Verbose training option
 func Verbose(v bool) TrainOption {
 	return func(tc *trainConfig) { tc.verbose = v }
+}
+
+// Momentum adds momentum to SGD optimizer for faster convergence
+func Momentum(m float64) TrainOption {
+	return func(tc *trainConfig) {
+		if m < 0.0 || m >= 1.0 {
+			m = 0.9 // Default momentum
+		}
+		tc.momentum = m
+	}
+}
+
+// LearningRateDecay applies exponential decay to learning rate
+func LearningRateDecay(factor float64, steps int) TrainOption {
+	return func(tc *trainConfig) {
+		if factor <= 0.0 || factor >= 1.0 {
+			factor = 0.95 // Default 5% decay
+		}
+		if steps <= 0 {
+			steps = 1000 // Default every 1000 epochs
+		}
+		tc.lrDecay = factor
+		tc.lrDecaySteps = steps
+	}
+}
+
+// EarlyStopping stops training when loss stops improving
+func EarlyStopping(patience int) TrainOption {
+	return func(tc *trainConfig) {
+		if patience < 0 {
+			patience = 100 // Default patience
+		}
+		tc.earlyStopping = patience
+	}
+}
+
+// GradientClip limits gradient norm for training stability
+func GradientClip(maxNorm float64) TrainOption {
+	return func(tc *trainConfig) {
+		if maxNorm <= 0 {
+			maxNorm = 5.0 // Default clipping
+		}
+		tc.gradClip = maxNorm
+	}
 }
 
 // Option is a functional option for configuring a Network.
@@ -152,10 +201,18 @@ func toActivation(name string) act.Activation {
 		return act.Identity()
 	case "relu":
 		return act.ReLU()
+	case "leaky_relu":
+		return act.LeakyReLU(0.01)
 	case "sigmoid":
 		return act.Sigmoid()
 	case "tanh":
 		return act.Tanh()
+	case "softmax":
+		return act.Softmax()
+	case "swish":
+		return act.Swish()
+	case "gelu":
+		return act.GELU()
 	default:
 		return act.Identity()
 	}
@@ -168,6 +225,10 @@ func toLoss(name string) loss.Loss {
 		return loss.MSE()
 	case "bce":
 		return loss.BCE()
+	case "categorical_crossentropy", "cce":
+		return loss.CategoricalCrossentropy()
+	case "sparse_categorical_crossentropy", "scce":
+		return loss.SparseCategoricalCrossentropy()
 	default:
 		return loss.MSE() // default
 	}

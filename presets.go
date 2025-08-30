@@ -64,11 +64,12 @@ func ClassificationMLP(inputSize, numClasses int, size string) Config {
 		}
 	}
 
+	// Use proper activations and loss for classification
 	outputAct := "sigmoid"
 	loss := "bce"
 	if numClasses > 2 {
-		outputAct = "identity" // For multiclass, use identity + crossentropy
-		loss = "mse"           // Simplified - in future phases we'll add categorical crossentropy
+		outputAct = "softmax"             // ✅ NOW USING SOFTMAX!
+		loss = "categorical_crossentropy" // ✅ NOW USING PROPER LOSS!
 	}
 
 	return Config{
