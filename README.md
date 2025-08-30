@@ -33,7 +33,7 @@ predictions, _ := net.PredictBatch(testData)
 
 ***
 
-## 📈 **Legacy & Evolution** ![Legacy Go](https://img.shields.io/badge/Go-Legacy-blue)
+## ![Legacy Go](https://img.shields.io/badge/Go-Legacy-blue) **Legacy & Evolution**
 
 relux evolved from [8-year-old neural network experiments](https://github.com/xDarkicex/GO-Portfolio/blob/master/app/neuron/neuron.go) into a production-ready framework. What started as basic perceptron code has grown into a complete ML toolkit that rivals Python frameworks in simplicity while delivering Go's performance and reliability.
 
