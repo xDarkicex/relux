@@ -152,6 +152,126 @@ func (d *Dense) Forward(x []float64) []float64 {
 	}
 }
 
+// Enhanced forward pass with Phase 2 optimizations
+func (d *Dense) ForwardBatch(inputs [][]float64) ([][]float64, error) {
+	batchSize := len(inputs)
+	if batchSize == 0 {
+		return nil, fmt.Errorf("empty batch")
+	}
+
+	// Validate all inputs
+	for i, x := range inputs {
+		if len(x) != d.in {
+			return nil, fmt.Errorf("input %d size mismatch: got %d, expected %d", i, len(x), d.in)
+		}
+	}
+
+	// Use enhanced backend for batch processing if available
+	if enhancedBackend, ok := d.backend.(*enhancedRnxaBackend); ok {
+		return d.forwardBatchOptimized(inputs, enhancedBackend)
+	}
+
+	// Fallback to sequential processing
+	outputs := make([][]float64, batchSize)
+	for i, input := range inputs {
+		outputs[i] = d.Forward(input)
+	}
+	return outputs, nil
+}
+
+func (d *Dense) forwardBatchOptimized(inputs [][]float64, backend *enhancedRnxaBackend) ([][]float64, error) {
+	batchSize := len(inputs)
+	config := GetPerformanceConfig()
+
+	// Create batch input matrix [batch_size × input_size]
+	batchInput := make([][]float64, batchSize)
+	copy(batchInput, inputs)
+
+	// Create weight matrix for batch multiplication [input_size × output_size]
+	weightMatrix := make([][]float64, d.in)
+	for i := 0; i < d.in; i++ {
+		weightMatrix[i] = make([]float64, d.out)
+		for j := 0; j < d.out; j++ {
+			weightMatrix[i][j] = d.W[j][i] // Transpose for correct multiplication
+		}
+	}
+
+	// Batch matrix multiplication: [batch_size × input_size] × [input_size × output_size]
+	var batchOutput [][]float64
+	var err error
+
+	if config.ShouldUseGPUForMatMul(batchSize, d.in, d.out) {
+		batchOutput, err = backend.MatMul(batchInput, weightMatrix)
+	} else {
+		batchOutput, err = backend.parallelCPUMatMul(batchInput, weightMatrix)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("batch matrix multiplication failed: %w", err)
+	}
+
+	// Add bias and apply activation for each output
+	outputs := make([][]float64, batchSize)
+	for b := 0; b < batchSize; b++ {
+		// Add bias
+		biasedOutput := make([]float64, d.out)
+		for j := 0; j < d.out; j++ {
+			biasedOutput[j] = batchOutput[b][j] + d.B[j]
+		}
+
+		// Store for backprop (only for last sample, simplified)
+		if b == batchSize-1 {
+			copy(d.lastZ, biasedOutput)
+			copy(d.lastInput, inputs[b])
+		}
+
+		// Apply activation
+		if d.Act.Name() == "softmax" {
+			outputs[b] = act.SoftmaxVec(biasedOutput)
+		} else if config.ShouldUseGPUForActivation(d.out) {
+			activated, err := backend.ActivationFunc(d.Act.Name(), biasedOutput)
+			if err == nil {
+				outputs[b] = activated
+			} else {
+				// Fallback to CPU activation
+				outputs[b] = make([]float64, d.out)
+				for i, z := range biasedOutput {
+					outputs[b][i] = d.Act.Apply(z)
+				}
+			}
+		} else {
+			// CPU activation for small outputs
+			outputs[b] = make([]float64, d.out)
+			for i, z := range biasedOutput {
+				outputs[b][i] = d.Act.Apply(z)
+			}
+		}
+	}
+
+	return outputs, nil
+}
+
+// Performance diagnostic method
+func (d *Dense) GetPerformanceInfo() map[string]interface{} {
+	info := make(map[string]interface{})
+
+	if d.backend != nil {
+		info["backend"] = d.backend.Name()
+		info["device_info"] = d.backend.DeviceInfo()
+		info["available"] = d.backend.Available()
+	}
+
+	config := GetPerformanceConfig()
+	complexity := d.in * d.out
+
+	info["layer_size"] = fmt.Sprintf("%d → %d", d.in, d.out)
+	info["complexity"] = complexity
+	info["will_use_gpu"] = config.ShouldUseGPUForMatMul(1, d.in, d.out)
+	info["activation_gpu"] = config.ShouldUseGPUForActivation(d.out)
+
+	return info
+}
+
 func (d *Dense) computeForwardFallback(x []float64) {
 	// Original implementation as fallback
 	for j := 0; j < d.out; j++ {
