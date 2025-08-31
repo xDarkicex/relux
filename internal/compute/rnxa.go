@@ -134,6 +134,64 @@ func (r *rnxaBackend) ActivationFunc(name string, x []float64) ([]float64, error
 	return result.Data(), nil
 }
 
+func (r *rnxaBackend) BatchMatMul(matrices [][][]float64) ([][][]float64, error) {
+	if len(matrices)%2 != 0 {
+		return nil, fmt.Errorf("batch matmul requires even number of matrices (pairs)")
+	}
+
+	results := make([][][]float64, len(matrices)/2)
+	for i := 0; i < len(matrices); i += 2 {
+		A, B := matrices[i], matrices[i+1]
+		result, err := r.MatMul(A, B)
+		if err != nil {
+			return nil, err
+		}
+		results[i/2] = result
+	}
+	return results, nil
+}
+
+func (r *rnxaBackend) ForwardBatch(inputs [][]float64, weights [][]float64, biases []float64, activation string) ([][]float64, error) {
+	batchSize := len(inputs)
+	outputs := make([][]float64, batchSize)
+
+	for i, input := range inputs {
+		// Standard forward pass: input * weights^T + bias
+		output := make([]float64, len(biases))
+
+		for j := 0; j < len(weights); j++ {
+			sum := biases[j]
+			for k := 0; k < len(input); k++ {
+				sum += input[k] * weights[j][k]
+			}
+			output[j] = sum
+		}
+
+		// Apply activation
+		activated, err := r.ActivationFunc(activation, output)
+		if err != nil {
+			return nil, err
+		}
+		outputs[i] = activated
+	}
+
+	return outputs, nil
+}
+
+func (r *rnxaBackend) GetPerformanceConfig() *PerformanceConfig {
+	return GetPerformanceConfig()
+}
+
+func (r *rnxaBackend) ShouldUseGPUForMatMul(M, N, K int) bool {
+	config := GetPerformanceConfig()
+	return config.ShouldUseGPUForMatMul(M, N, K)
+}
+
+func (r *rnxaBackend) ShouldUseGPUForActivation(size int) bool {
+	config := GetPerformanceConfig()
+	return config.ShouldUseGPUForActivation(size)
+}
+
 func (r *rnxaBackend) Name() string    { return r.name }
 func (r *rnxaBackend) Available() bool { return r.engine.Available() }
 func (r *rnxaBackend) DeviceInfo() string {
