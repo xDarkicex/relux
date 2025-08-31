@@ -6,6 +6,7 @@ import (
 	"math/rand"
 
 	"github.com/xDarkicex/relux/internal/act"
+	"github.com/xDarkicex/relux/internal/compute"
 )
 
 type Layer interface {
@@ -28,6 +29,9 @@ type Dense struct {
 	// Phase 5: Momentum velocities
 	VW [][]float64 // Weight velocities
 	VB []float64   // Bias velocities
+
+	// NEW: Compute backend
+	backend compute.ComputeBackend
 }
 
 func NewDense(in, out int, a act.Activation, rnd *rand.Rand) *Dense {
@@ -72,6 +76,7 @@ func NewDense(in, out int, a act.Activation, rnd *rand.Rand) *Dense {
 		W: W, B: B, Act: a, in: in, out: out,
 		lastInput: make([]float64, in),
 		lastZ:     make([]float64, out),
+		backend:   compute.NewComputeBackend(), // NEW: Auto-detect backend
 	}
 }
 
@@ -101,7 +106,54 @@ func (d *Dense) Forward(x []float64) []float64 {
 	// Cache input for backprop
 	copy(d.lastInput, x)
 
-	// Reuse lastZ slice for pre-activation
+	// Use compute backend for matrix multiplication
+	// Convert weights to [][]float64 format
+	weightsMatrix := make([][]float64, d.out)
+	for j := 0; j < d.out; j++ {
+		weightsMatrix[j] = make([]float64, d.in)
+		copy(weightsMatrix[j], d.W[j])
+	}
+
+	// Input as 1x(in) matrix
+	inputMatrix := [][]float64{x}
+
+	// Accelerated matrix multiplication: [1×in] × [in×out] = [1×out]
+	if d.backend != nil {
+		if result, err := d.backend.MatMul(inputMatrix, weightsMatrix); err == nil && len(result) > 0 {
+			// Extract result and add bias
+			for j := 0; j < d.out; j++ {
+				d.lastZ[j] = result[0][j] + d.B[j]
+			}
+		} else {
+			// Fallback to original implementation
+			d.computeForwardFallback(x)
+		}
+	} else {
+		d.computeForwardFallback(x)
+	}
+
+	// Apply activation function
+	if d.Act.Name() == "softmax" {
+		return act.SoftmaxVec(d.lastZ)
+	} else {
+		// Try accelerated activation
+		if d.backend != nil {
+			if result, err := d.backend.ActivationFunc(d.Act.Name(), d.lastZ); err == nil {
+				return result
+			}
+		}
+
+		// Fallback to native activation
+		out := make([]float64, d.out)
+		for i, z := range d.lastZ {
+			out[i] = d.Act.Apply(z)
+		}
+		return out
+	}
+}
+
+func (d *Dense) computeForwardFallback(x []float64) {
+	// Original implementation as fallback
 	for j := 0; j < d.out; j++ {
 		sum := d.B[j]
 		wj := d.W[j]
@@ -109,19 +161,6 @@ func (d *Dense) Forward(x []float64) []float64 {
 			sum += wj[i] * x[i]
 		}
 		d.lastZ[j] = sum
-	}
-
-	// Apply activation - handle softmax specially
-	if d.Act.Name() == "softmax" {
-		// Import the act package function for proper softmax
-		return act.SoftmaxVec(d.lastZ)
-	} else {
-		// Apply other activations element-wise
-		out := make([]float64, d.out)
-		for i, z := range d.lastZ {
-			out[i] = d.Act.Apply(z)
-		}
-		return out
 	}
 }
 
@@ -207,4 +246,12 @@ func (d *Dense) InitializeCache(inputSize, outputSize int) {
 	d.out = outputSize
 	d.lastInput = make([]float64, inputSize)
 	d.lastZ = make([]float64, outputSize)
+}
+
+// Add cleanup method
+func (d *Dense) Close() error {
+	if d.backend != nil {
+		return d.backend.Close()
+	}
+	return nil
 }
