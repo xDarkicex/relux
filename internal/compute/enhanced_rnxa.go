@@ -5,9 +5,11 @@ package compute
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 
+	"github.com/xDarkicex/relux/internal/act"
 	"github.com/xDarkicex/rnxa"
 )
 
@@ -308,4 +310,101 @@ func (e *enhancedRnxaBackend) processBatchVectorOp(vectors [][]float64, operatio
 	}
 
 	return results, nil
+}
+
+func (e *enhancedRnxaBackend) ForwardBatch(inputs [][]float64, weights [][]float64, biases []float64, activation string) ([][]float64, error) {
+	batchSize := len(inputs)
+	config := e.GetPerformanceConfig()
+
+	// Create weight matrix for batch multiplication [input_size × output_size]
+	weightMatrix := make([][]float64, len(weights[0]))
+	for i := 0; i < len(weights[0]); i++ {
+		weightMatrix[i] = make([]float64, len(weights))
+		for j := 0; j < len(weights); j++ {
+			weightMatrix[i][j] = weights[j][i] // Transpose for correct multiplication
+		}
+	}
+
+	// Batch matrix multiplication
+	var batchOutput [][]float64
+	var err error
+
+	if config.ShouldUseGPUForMatMul(batchSize, len(weights[0]), len(weights)) {
+		batchOutput, err = e.gpuMatMul(inputs, weightMatrix)
+	} else if batchSize*len(weights[0])*len(weights) >= config.MatMulCPUParallel*config.MatMulCPUParallel*config.MatMulCPUParallel {
+		batchOutput, err = e.parallelCPUMatMul(inputs, weightMatrix)
+	} else {
+		batchOutput, err = e.rnxaBackend.MatMul(inputs, weightMatrix)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("batch matrix multiplication failed: %w", err)
+	}
+
+	// Add bias and apply activation for each output
+	outputs := make([][]float64, batchSize)
+	for b := 0; b < batchSize; b++ {
+		// Add bias
+		biasedOutput := make([]float64, len(biases))
+		for j := 0; j < len(biases); j++ {
+			biasedOutput[j] = batchOutput[b][j] + biases[j]
+		}
+
+		// Apply activation
+		if activation == "softmax" {
+			outputs[b] = act.SoftmaxVec(biasedOutput)
+		} else if config.ShouldUseGPUForActivation(len(biases)) {
+			activated, err := e.ActivationFunc(activation, biasedOutput)
+			if err == nil {
+				outputs[b] = activated
+			} else {
+				// Fallback to CPU activation
+				outputs[b] = make([]float64, len(biases))
+				for i, z := range biasedOutput {
+					outputs[b][i] = resolveAndApplyActivation(activation, z)
+				}
+			}
+		} else {
+			// CPU activation for small outputs
+			activated, err := e.ActivationFunc(activation, biasedOutput)
+			if err != nil {
+				return nil, err
+			}
+			outputs[b] = activated
+		}
+	}
+
+	return outputs, nil
+}
+
+func (e *enhancedRnxaBackend) GetPerformanceConfig() *PerformanceConfig {
+	return e.config
+}
+
+func (e *enhancedRnxaBackend) ShouldUseGPUForMatMul(M, N, K int) bool {
+	return e.config.ShouldUseGPUForMatMul(M, N, K)
+}
+
+func (e *enhancedRnxaBackend) ShouldUseGPUForActivation(size int) bool {
+	return e.config.ShouldUseGPUForActivation(size)
+}
+
+// Helper function for activation resolution
+func resolveAndApplyActivation(activation string, x float64) float64 {
+	switch activation {
+	case "relu":
+		if x > 0 {
+			return x
+		} else {
+			return 0
+		}
+	case "sigmoid":
+		return 1.0 / (1.0 + math.Exp(-x))
+	case "tanh":
+		return math.Tanh(x)
+	case "identity":
+		return x
+	default:
+		return x
+	}
 }
