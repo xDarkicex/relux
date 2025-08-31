@@ -85,6 +85,15 @@ func NewComputeBackend(opts ...BackendOption) ComputeBackend {
 }
 
 func tryRnxaBackend() (ComputeBackend, error) {
+	// Try enhanced backend first
+	if backend, err := newEnhancedRnxaBackend(); err == nil {
+		if backend.Available() {
+			return backend, nil
+		}
+		backend.Close()
+	}
+
+	// Fallback to basic rnxa backend
 	backend, err := newRnxaBackend()
 	if err != nil {
 		return nil, fmt.Errorf("rnxa backend unavailable: %w", err)
