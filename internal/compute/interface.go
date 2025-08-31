@@ -1,18 +1,26 @@
 package compute
 
 // ComputeBackend provides hardware-accelerated tensor operations
-// Framework-agnostic interface that works with any backend
 type ComputeBackend interface {
-	// Core matrix operations (80% of ML compute time)
+	// Core matrix operations
 	MatMul(A, B [][]float64) ([][]float64, error)
 
-	// Vector operations for bias addition and element-wise ops
+	// Vector operations
 	VectorAdd(A, B []float64) ([]float64, error)
 	VectorSub(A, B []float64) ([]float64, error)
-	VectorMul(A, B []float64) ([]float64, error) // Element-wise
+	VectorMul(A, B []float64) ([]float64, error)
 
-	// Activation functions (critical for training performance)
+	// Activation functions
 	ActivationFunc(name string, x []float64) ([]float64, error)
+
+	// Enhanced batch operations
+	BatchMatMul(matrices [][][]float64) ([][][]float64, error)
+	ForwardBatch(inputs [][]float64, weights [][]float64, biases []float64, activation string) ([][]float64, error)
+
+	// Performance configuration access
+	GetPerformanceConfig() *PerformanceConfig
+	ShouldUseGPUForMatMul(M, N, K int) bool
+	ShouldUseGPUForActivation(size int) bool
 
 	// Backend information
 	Name() string
@@ -25,7 +33,7 @@ type ComputeBackend interface {
 type BackendType int
 
 const (
-	BackendAuto   BackendType = iota // Auto-detect best backend
-	BackendNative                    // Pure Go implementation
-	BackendRnxa                      // rnxa hardware acceleration
+	BackendAuto BackendType = iota
+	BackendNative
+	BackendRnxa
 )

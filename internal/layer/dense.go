@@ -181,7 +181,7 @@ func (d *Dense) ForwardBatch(inputs [][]float64) ([][]float64, error) {
 
 func (d *Dense) forwardBatchOptimized(inputs [][]float64, backend *enhancedRnxaBackend) ([][]float64, error) {
 	batchSize := len(inputs)
-	config := GetPerformanceConfig()
+	config := compute.GetPerformanceConfig()
 
 	// Create batch input matrix [batch_size × input_size]
 	batchInput := make([][]float64, batchSize)
@@ -261,7 +261,7 @@ func (d *Dense) GetPerformanceInfo() map[string]interface{} {
 		info["available"] = d.backend.Available()
 	}
 
-	config := GetPerformanceConfig()
+	config := compute.GetPerformanceConfig()
 	complexity := d.in * d.out
 
 	info["layer_size"] = fmt.Sprintf("%d → %d", d.in, d.out)

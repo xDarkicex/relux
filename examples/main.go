@@ -241,7 +241,9 @@ func main() {
 		relux.EarlyStopping(50),   // Stop before overfitting
 		relux.BatchSize(6),        // Full batch
 		relux.Verbose(true),
+		relux.LearningRateDecay(0.87, 500),
 	)
+
 	// Test classification with detailed probability output
 	fmt.Println("Phase 4 Classification Results (with probabilities):")
 	classes := []string{"Setosa", "Versicolor", "Virginica"}

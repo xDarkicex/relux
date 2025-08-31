@@ -110,9 +110,6 @@ func (e *enhancedRnxaBackend) MatMul(A, B [][]float64) ([][]float64, error) {
 }
 
 func (e *enhancedRnxaBackend) gpuMatMul(A, B [][]float64) ([][]float64, error) {
-	// Use pooled tensors to reduce allocation overhead
-	M, K, N := len(A), len(A[0]), len(B[0])
-
 	// Convert with memory pooling
 	tensorA := e.convertMatrixToTensorPooled(A)
 	defer e.releaseTensor(tensorA)
@@ -283,4 +280,32 @@ func (e *enhancedRnxaBackend) Close() error {
 	}
 
 	return e.rnxaBackend.Close()
+}
+
+func (e *enhancedRnxaBackend) processBatchVectorOp(vectors [][]float64, operation string) ([][]float64, error) {
+	results := make([][]float64, len(vectors)/2)
+
+	for i := 0; i < len(vectors); i += 2 {
+		A, B := vectors[i], vectors[i+1]
+		var result []float64
+		var err error
+
+		switch operation {
+		case "add":
+			result, err = e.VectorAdd(A, B)
+		case "sub":
+			result, err = e.VectorSub(A, B)
+		case "mul":
+			result, err = e.VectorMul(A, B)
+		default:
+			return nil, fmt.Errorf("unsupported vector operation: %s", operation)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+		results[i/2] = result
+	}
+
+	return results, nil
 }
