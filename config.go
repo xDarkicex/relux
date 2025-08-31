@@ -3,6 +3,7 @@ package relux
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/xDarkicex/relux/internal/act"
@@ -129,8 +130,11 @@ func GradientClip(maxNorm float64) TrainOption {
 type Option func(*builder) error
 
 type builder struct {
-	cfg Config
-	rnd *rand.Rand
+	cfg            Config
+	rnd            *rand.Rand
+	forceNative    bool
+	preferRnxa     bool
+	accelThreshold int
 }
 
 // NewNetwork constructs a multilayer perceptron with sensible defaults
@@ -190,6 +194,31 @@ func WithConfig(c Config) Option {
 func WithSeed(seed int64) Option {
 	return func(b *builder) error {
 		b.rnd = rand.New(rand.NewSource(seed))
+		return nil
+	}
+}
+
+// WithAcceleration sets backend acceleration preferences
+func WithAcceleration(backend string) Option {
+	return func(b *builder) error {
+		switch strings.ToLower(backend) {
+		case "auto":
+			// Default behavior
+		case "native", "cpu":
+			b.forceNative = true
+		case "rnxa":
+			b.preferRnxa = true
+		default:
+			return fmt.Errorf("unsupported backend: %s", backend)
+		}
+		return nil
+	}
+}
+
+// WithAccelerationThreshold sets minimum size for acceleration
+func WithAccelerationThreshold(minSize int) Option {
+	return func(b *builder) error {
+		b.accelThreshold = minSize
 		return nil
 	}
 }
