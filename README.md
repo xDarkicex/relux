@@ -1,4 +1,5 @@
-# **relux** – Enterprise-Grade Neural Networks in Pure Go  
+# **RELUX**
+## Enterprise-Grade Neural Networks in Pure Go  
 ### Hardware-Accelerated ML with Zero Runtime Dependencies
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org/)
