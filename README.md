@@ -77,7 +77,7 @@ The [**rnxa**](https://github.com/xDarkicex/rnxa) acceleration engine provides s
 
 ### **Platform Support Matrix**
 - **✅ Apple Silicon (M1/M2/M3+)** – Metal Performance Shaders via rnxa (Production Ready)
-- **🚧 Linux CUDA** – Planned Q2 2026 via rnxa
+- **🚧 Linux CUDA** – Planned Q1 2026 via rnxa
 - **🚧 Windows DirectML** – Planned Q3 2026 via rnxa
 - **✅ Universal Fallback** – Pure Go implementation on all platforms
 
