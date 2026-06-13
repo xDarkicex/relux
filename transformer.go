@@ -431,10 +431,15 @@ func stateFromAdam(a *optim.Adam) *optim.State {
 	return &st
 }
 
-// Generate runs the autoregressive loop. Returns up to
-// maxNew tokens (or stops at eosID). The prompt is
-// encoded as a sequence of token IDs; the output is the
-// prompt plus the generated tokens.
+// Generate runs the autoregressive loop with KV-cache.
+// Returns up to maxNew tokens. The prompt is encoded as a
+// sequence of token IDs; the output is the prompt plus the
+// generated tokens.
+//
+// The first call creates a bf16 KV-cache wired into every
+// block's MHA. Prefill computes K/V for the full prompt;
+// subsequent decode steps process one token at a time with
+// O(n) work per token instead of O(nÂ²).
 //
 // Temperature, topK, topP follow the Sampler semantics.
 // `rng` is optional; if nil, a fresh source is used.
@@ -455,19 +460,35 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 		Rand:        rng,
 	}
 	t.SetMode(transformer.Inference)
-	out := append([]int{}, prompt...)
-	for i := 0; i < maxNew; i++ {
-		logits := t.Forward(out)
-		// logits shape [1, seq, vocab]. Take the last
-		// position.
+
+	// Create KV-cache (bf16 for memory efficiency) and wire into blocks.
+	cache := transformer.NewKVCache(len(t.blocks), transformer.BFloat16)
+	for i, b := range t.blocks {
+		mha := b.BlockMHA()
+		mha.Cache = cache
+		mha.LayerIdx = i
+	}
+	defer func() {
+		for _, b := range t.blocks {
+			b.BlockMHA().Cache = nil
+		}
+		cache.Reset()
+	}()
+
+	// Prefill: compute + cache K/V for the full prompt.
+	prefillLogits := t.Forward(prompt)
+	prefillData, _ := prefillLogits.ToF32()
+	vocab := prefillLogits.Shape()[2]
+	lastPos := len(prompt) - 1
+	next := sampler.Sample(prefillData[lastPos*vocab : (lastPos+1)*vocab])
+	out := append(append([]int{}, prompt...), next)
+
+	// Decode loop: one token at a time from the cache.
+	for i := 1; i < maxNew; i++ {
+		logits := t.Forward([]int{next})
 		logitsData, _ := logits.ToF32()
-		seq := logits.Shape()[1]
-		vocab := logits.Shape()[2]
-		lastLogits := logitsData[(seq-1)*vocab : seq*vocab]
-		next := sampler.Sample(lastLogits)
+		next = sampler.Sample(logitsData[:vocab])
 		out = append(out, next)
-		// (v1: no EOS termination. The caller can post-
-		// process the output to strip EOS if they want.)
 	}
 	return out, nil
 }

@@ -1067,6 +1067,7 @@ in flight. 🔮 items are scoped but not yet started.
 | Streaming dataset pipeline | ✅ | `dataset/` — `Iterator` interface + 3 impls: `WindowedIterator`, `TextFileIterator`, `MmapIterator` |
 | Corpus pre-tokenization | ✅ | `dataset.Preprocess`, `PreprocessWithSeparators` → int32 binary files |
 | Transformer streaming training | ✅ | `Transformer.FitIterator(iter Iterator, ...)` — auto-reset multi-epoch |
+| KV-cache inference | ✅ | `Generate` uses bf16 KV-cache; prefill + decode, O(n) per token generation |
 | **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
 | v0 .relux (gob) back compat | ✅ | `Network.Load` sniffs magic; dispatches v0/v1 |
 | Optimizer state round-trip | ✅ | Adam m/v preserved losslessly across save/load |
@@ -1110,6 +1111,7 @@ in flight. 🔮 items are scoped but not yet started.
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **KV-cache wired into Generate.** Prefill caches K/V (bf16, pre-GQA-expand) for the full prompt; subsequent decode steps process one token at a time attending over the full cached sequence. Causal mask is correct for both phases. O(n²) total vs O(n³) without cache.
 - **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. Per-token CE gradient naturally focuses the gradient on the target position; log-sum-exp trick preserves numerical stability for large vocabularies.
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
   `tokenizer/` (wraps `sugarme/tokenizer`, loads any `tokenizer.json`)

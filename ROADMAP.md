@@ -65,6 +65,7 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 | TextFileIterator | `dataset/textfile.go` — reads text files, tokenizes on the fly, ring-buffers tokens |
 | MmapIterator | `dataset/memmap.go` — reads pre-tokenized int32 binary files; `Preprocess`/`PreprocessWithSeparators` build them |
 | Transformer.FitIterator | `transformer.go` — trains from an `Iterator`; auto-reset on exhaustion for multi-epoch |
+| KV-cache inference | `mha.go::forwardCached` — prefill + decode; bf16 cache stores post-RoPE K/V (numKVHeads); `Generate` uses one-token-at-a-time decode loop |
 
 ### Training
 | Area | Notes |
@@ -110,7 +111,6 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 |------|:------:|-------|
 | CLI (`cmd/relux`) | 2026 Q3 | `relux train`, `relux generate`, `relux inspect` — drives the public `Transformer` API. Reads v1 .relux files. |
 | Multi-Token Prediction (MTP) loss | 2026 Q3 | Current Transformer.TrainStep does single-token next-token prediction; MTP (predict tokens k+1, k+2, … simultaneously) is the standard richer supervision signal. Drop-in for the loss path. |
-| KV-cache | 2026 Q3 | `internal/transformer/kvcache.go` exists but isn't wired into `Transformer.Generate`; the public API still does the slow per-token prefill. |
 | Per-axis Sum / Mean on GPU | 2026 Q4 | rnxa-side; the layernorm / softmax reduction loops are pure Go today. |
 | CUDA end-to-end validation | 2026 Q4 | Build agent with `nvcc` + an NVIDIA GPU; runs `internal/compute/cuda/cuda_test.go` and the full rnxa test sweep. |
 
@@ -138,6 +138,7 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 
 ## Recent Milestones (reverse chronological)
 
+- **2026 Q2** — **KV-cache wired into Generate.** Prefill caches K/V for full prompt; decode processes one token per step attending over the full cached sequence. O(n²) total.
 - **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. The per-token CE gradient naturally focuses on the target position; log-sum-exp preserves numerical stability for large vocabularies (50k+).
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
   `tokenizer/` (wraps `sugarme/tokenizer` to load any `tokenizer.json` —

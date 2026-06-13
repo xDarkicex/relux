@@ -46,6 +46,9 @@ type MHA struct {
 	Wv optim.Param
 	Wo optim.Param
 
+	Cache    *KVCache // inference-only; nil means no cache
+	LayerIdx int      // which layer this MHA belongs to
+
 	// Forward cache (Train mode). Set during Forward,
 	// consumed by Backward, freed at the end of Backward.
 	lastX           []float32 // [batch*seq, dModel]
@@ -118,6 +121,9 @@ func (m *MHA) Forward(x *Tensor) *Tensor {
 	}
 	if x.shape[2] != m.dModel {
 		panic(fmt.Sprintf("MHA.Forward: input last dim=%d, want %d", x.shape[2], m.dModel))
+	}
+	if m.Mode() == Inference && m.Cache != nil {
+		return m.forwardCached(x)
 	}
 	batch := x.shape[0]
 	seqQ := x.shape[1]
@@ -218,6 +224,137 @@ func (m *MHA) Forward(x *Tensor) *Tensor {
 		alloc.Free(rearrangedBack)
 		alloc.Free(attnWeights)
 	}
+
+	return out
+}
+
+// forwardCached is the inference-only forward path with KV-cache.
+// When the cache is empty it performs a prefill (compute + cache K/V
+// for all input positions). When the cache has entries it performs
+// decode (compute K/V for the new position only, append, attend over
+// the full cached sequence).
+func (m *MHA) forwardCached(x *Tensor) *Tensor {
+	batch := x.shape[0]
+	seqQ := x.shape[1]
+	xData, _ := x.ToF32()
+
+	// 1. Project Q from input (same as standard forward).
+	qData := alloc.Float32(batch * seqQ * m.numHeads * m.headDim)
+	matmulBatched3D(qData, xData, m.Wq.Data, batch, seqQ, m.dModel, m.numHeads*m.headDim)
+
+	// 2. Project K, V from input.
+	kData := alloc.Float32(batch * seqQ * m.numKVHeads * m.headDim)
+	vData := alloc.Float32(batch * seqQ * m.numKVHeads * m.headDim)
+	matmulBatched3D(kData, xData, m.Wk.Data, batch, seqQ, m.dModel, m.numKVHeads*m.headDim)
+	matmulBatched3D(vData, xData, m.Wv.Data, batch, seqQ, m.dModel, m.numKVHeads*m.headDim)
+
+	cacheLen := m.Cache.TotalLen(m.LayerIdx)
+
+	// 3. Rearrange BSNH.
+	qRearranged := rearrangeBSNH(qData, batch, seqQ, m.numHeads, m.headDim)
+	kRearranged := rearrangeBSNH(kData, batch, seqQ, m.numKVHeads, m.headDim)
+	vRearranged := rearrangeBSNH(vData, batch, seqQ, m.numKVHeads, m.headDim)
+	alloc.Free(qData)
+	alloc.Free(kData)
+	alloc.Free(vData)
+
+	// 4. RoPE: Q with offset=cacheLen, K with offset=cacheLen.
+	if m.rope != nil {
+		qT := &Tensor{shape: []int{batch, m.numHeads, seqQ, m.headDim}, dtype: Float32, f32: qRearranged}
+		qRopeT := m.rope.Apply(qT, cacheLen)
+		copy(qRearranged, qRopeT.f32)
+		alloc.Free(qRopeT.f32)
+
+		kT := &Tensor{shape: []int{batch, m.numKVHeads, seqQ, m.headDim}, dtype: Float32, f32: kRearranged}
+		kRopeT := m.rope.Apply(kT, cacheLen)
+		copy(kRearranged, kRopeT.f32)
+		alloc.Free(kRopeT.f32)
+	}
+
+	// 5. Append new K/V to cache (pre-GQA-expand, numKVHeads).
+	// The cache stores bf16; Append handles the f32->bf16 cast.
+	kCacheT := &Tensor{shape: []int{batch, m.numKVHeads, seqQ, m.headDim}, dtype: Float32, f32: kRearranged}
+	vCacheT := &Tensor{shape: []int{batch, m.numKVHeads, seqQ, m.headDim}, dtype: Float32, f32: vRearranged}
+	m.Cache.Append(m.LayerIdx, kCacheT, vCacheT)
+	alloc.Free(kRearranged)
+	alloc.Free(vRearranged)
+
+	// 6. Read full cached K/V → widen bf16→f32.
+	fullK, fullV := m.Cache.View(m.LayerIdx)
+	// fullK, fullV shape: [batch, numKVHeads, totalLen, headDim]
+	cachedKData, _ := fullK.ToF32()
+	cachedVData, _ := fullV.ToF32()
+	totalLen := fullK.shape[fullK.Rank()-2]
+
+	// 7. GQA expand cached K/V: numKVHeads → numHeads.
+	g := m.numHeads / m.numKVHeads
+	var kExpanded, vExpanded []float32
+	if g > 1 {
+		kExpanded = alloc.Float32(batch * m.numHeads * totalLen * m.headDim)
+		vExpanded = alloc.Float32(batch * m.numHeads * totalLen * m.headDim)
+		for b := 0; b < batch; b++ {
+			for h := 0; h < m.numHeads; h++ {
+				kvH := h / g
+				ksrc := ((b*m.numKVHeads + kvH)*totalLen + 0) * m.headDim
+				kdst := ((b*m.numHeads + h)*totalLen + 0) * m.headDim
+				copy(kExpanded[kdst:kdst+totalLen*m.headDim], cachedKData[ksrc:ksrc+totalLen*m.headDim])
+				copy(vExpanded[kdst:kdst+totalLen*m.headDim], cachedVData[ksrc:ksrc+totalLen*m.headDim])
+			}
+		}
+	} else {
+		kExpanded = cachedKData
+		vExpanded = cachedVData
+	}
+
+	// 8. Attention: Q (seqQ) × K^T (totalLen), softmax, × V.
+	scale := float32(1.0 / math.Sqrt(float64(m.headDim)))
+	attnOut := alloc.Float32(batch * m.numHeads * seqQ * m.headDim)
+	attnWeights := alloc.Float32(batch * m.numHeads * seqQ * totalLen)
+
+	for b := 0; b < batch; b++ {
+		for h := 0; h < m.numHeads; h++ {
+			qOff := (b*m.numHeads + h) * seqQ * m.headDim
+			kOff := (b*m.numHeads + h) * totalLen * m.headDim
+			vOff := (b*m.numHeads + h) * totalLen * m.headDim
+			wOff := (b*m.numHeads + h) * seqQ * totalLen
+			oOff := (b*m.numHeads + h) * seqQ * m.headDim
+
+			// Scores = Q @ K^T.
+			matmulFloat32TransB(attnWeights[wOff:wOff+seqQ*totalLen], qRearranged[qOff:qOff+seqQ*m.headDim], kExpanded[kOff:kOff+totalLen*m.headDim], seqQ, m.headDim, totalLen)
+
+			for i := 0; i < seqQ; i++ {
+				for j := 0; j < totalLen; j++ {
+					attnWeights[wOff+i*totalLen+j] *= scale
+					// Causal mask: only during prefill (seqQ == totalLen).
+					// During decode (seqQ < totalLen), Q is at the end
+					// of the sequence and can attend to all cached K.
+					if m.causal && seqQ == totalLen && j > i {
+						attnWeights[wOff+i*totalLen+j] = float32(math.Inf(-1))
+					}
+				}
+			}
+			softmaxRows(attnWeights[wOff:wOff+seqQ*totalLen], seqQ, totalLen)
+			matmulFloat32(attnOut[oOff:oOff+seqQ*m.headDim], attnWeights[wOff:wOff+seqQ*totalLen], vExpanded[vOff:vOff+totalLen*m.headDim], seqQ, totalLen, m.headDim)
+		}
+	}
+
+	if g > 1 {
+		alloc.Free(kExpanded)
+		alloc.Free(vExpanded)
+	}
+	alloc.Free(attnWeights)
+
+	// 9. Rearrange back + Wo projection.
+	rearrangedBack := rearrangeBHSN(attnOut, batch, m.numHeads, seqQ, m.headDim)
+	alloc.Free(attnOut)
+	out := ZerosF32(batch, seqQ, m.dModel)
+	matmulBatched3D(out.DataF32(), rearrangedBack, m.Wo.Data, batch, seqQ, m.numHeads*m.headDim, m.dModel)
+
+	// Free temporaries.
+	alloc.Free(xData)
+	alloc.Free(qRearranged)
+	alloc.Free(rearrangedBack)
+	// cachedKData/cachedVData may alias cache storage; don't free.
 
 	return out
 }
