@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/xDarkicex/relux"
+	"github.com/xDarkicex/relux/dataset"
 	"github.com/xDarkicex/relux/internal/transformer"
 )
 
@@ -359,5 +360,67 @@ func TestTransformer_V1FileHeader(t *testing.T) {
 	}
 	if !bytes.HasPrefix(buf.Bytes(), []byte{'R', 'E', 'L', 'V'}) {
 		t.Errorf("file does not start with RELV magic: %q", buf.Bytes()[:4])
+	}
+}
+
+// TestTransformer_FitIterator verifies that FitIterator reduces loss
+// on a synthetic dataset using a WindowedIterator.
+func TestTransformer_FitIterator(t *testing.T) {
+	cfg := relux.ConfigTransformer{
+		VocabSize:  20,
+		DModel:     16,
+		NumHeads:   4,
+		NumKVHeads: 2,
+		NumLayers:  2,
+		DFF:        32,
+		MaxSeqLen:  8,
+	}
+	tr, err := relux.NewTransformer(cfg)
+	if err != nil {
+		t.Fatalf("NewTransformer: %v", err)
+	}
+
+	// Build a structured token stream: repeating increment pattern.
+	// 20 repetitions of 0..19 gives 400 tokens.
+	tokens := make([]int, 0, 400)
+	for rep := 0; rep < 20; rep++ {
+		for i := 0; i < 20; i++ {
+			tokens = append(tokens, i)
+		}
+	}
+
+	// Measure initial loss on first window.
+	it := dataset.NewWindowedIterator(tokens, 8, 1, 1)
+	batch, err := it.Next()
+	if err != nil {
+		t.Fatalf("initial Next: %v", err)
+	}
+	initialLoss, err := tr.TrainStep(batch.Input[0], batch.Target[0])
+	if err != nil {
+		t.Fatalf("initial TrainStep: %v", err)
+	}
+
+	// Train via FitIterator.
+	avgLoss, err := tr.FitIterator(
+		dataset.NewWindowedIterator(tokens, 8, 1, 1),
+		200,     // steps
+		0.01,    // learning rate
+		nil,     // default RNG
+	)
+	if err != nil {
+		t.Fatalf("FitIterator: %v", err)
+	}
+
+	// Measure final loss on the same window.
+	it2 := dataset.NewWindowedIterator(tokens, 8, 1, 1)
+	batch2, _ := it2.Next()
+	finalLoss, err := tr.TrainStep(batch2.Input[0], batch2.Target[0])
+	if err != nil {
+		t.Fatalf("final TrainStep: %v", err)
+	}
+
+	if finalLoss >= initialLoss {
+		t.Errorf("loss did not decrease: initial=%v, final=%v, avg=%v",
+			initialLoss, finalLoss, avgLoss)
 	}
 }

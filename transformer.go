@@ -3,8 +3,10 @@ package relux
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 
+	"github.com/xDarkicex/relux/dataset"
 	"github.com/xDarkicex/relux/internal/compute"
 	"github.com/xDarkicex/relux/internal/optim"
 	"github.com/xDarkicex/relux/internal/transformer"
@@ -344,6 +346,67 @@ func (t *Transformer) Fit(dataset [][]int, seqLen int, steps int, lr float32, rn
 	// Cache the optimizer state so Save() can include it.
 	t.optimState = stateFromAdam(t.adam)
 	return totalLoss / float32(steps), nil
+}
+
+// FitIterator trains the transformer using a streaming dataset
+// iterator. It sequentially processes batches from the iterator,
+// calling TrainStep on each input/target pair. When the iterator
+// is exhausted and steps remain, Reset is called to begin another
+// epoch.
+//
+// Batches are processed one sequence at a time through TrainStep
+// (no batched matmul). Batched forward/backward is deferred to a
+// dedicated follow-up project.
+func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, rng *rand.Rand) (float32, error) {
+	if steps <= 0 {
+		return 0, errors.New("relux.Transformer.FitIterator: steps must be > 0")
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	if t.adam == nil {
+		t.adam = &optim.Adam{
+			LR:    lr,
+			Beta1: 0.9,
+			Beta2: 0.999,
+			Eps:   1e-8,
+		}
+	}
+	var totalLoss float32
+	validSteps := 0
+	for step := 0; step < steps; step++ {
+		batch, err := iter.Next()
+		if err == io.EOF {
+			iter.Reset()
+			batch, err = iter.Next()
+			if err != nil {
+				continue
+			}
+		} else if err != nil {
+			return totalLoss / float32(max(validSteps, 1)), err
+		}
+		// Process each sequence in the batch one at a time.
+		for i := range batch.Input {
+			input := batch.Input[i]
+			target := batch.Target[i]
+			// Zero gradients.
+			for _, p := range t.Params() {
+				for j := range p.Grad {
+					p.Grad[j] = 0
+				}
+			}
+			loss, err := t.TrainStep(input, target)
+			if err != nil {
+				return totalLoss / float32(max(validSteps, 1)), err
+			}
+			optim.ClipGradNorm(t.Params(), 1.0)
+			t.adam.Step(t.Params())
+			totalLoss += loss
+			validSteps++
+		}
+	}
+	t.optimState = stateFromAdam(t.adam)
+	return totalLoss / float32(max(validSteps, 1)), nil
 }
 
 // stateFromAdam extracts the State from an Adam.

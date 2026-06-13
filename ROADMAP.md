@@ -55,14 +55,26 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 | bf16 matmul helpers | `internal/transformer/mha.go::matmulBatched3D` widens bf16 → f32 on the fly |
 | Network (MLP) and Transformer both use bf16 | the entire codebase is on the same numeric contract |
 
+### Data pipeline
+| Area | Notes |
+|------|-------|
+| HuggingFace tokenizer loading | `tokenizer/` — thin wrapper around `sugarme/tokenizer`; `Load(path)` parses any `tokenizer.json` (BPE, WordPiece, WordLevel) |
+| Encode / Decode | `tokenizer.Tokenizer.Encode`, `Decode`, `EncodeWithSpecial`, `VocabSize`, `BOS`/`EOS`/`PAD`/`UNK` accessors |
+| Streaming dataset iterator | `dataset/` — `Batch` struct, `Iterator` interface; three concrete implementations |
+| WindowedIterator | `dataset/windowed.go` — sliding windows over in-memory `[]int` token IDs |
+| TextFileIterator | `dataset/textfile.go` — reads text files, tokenizes on the fly, ring-buffers tokens |
+| MmapIterator | `dataset/memmap.go` — reads pre-tokenized int32 binary files; `Preprocess`/`PreprocessWithSeparators` build them |
+| Transformer.FitIterator | `transformer.go` — trains from an `Iterator`; auto-reset on exhaustion for multi-epoch |
+
 ### Training
 | Area | Notes |
 |------|-------|
 | LR decay, early stopping, gradient clip | `config.go` train options |
 | Mini-batch training with shuffle | `config.go` train options |
 | Training loop with forward + backward + Adam step | Transformer.Fit, Network.Fit |
+| Streaming training loop | Transformer.FitIterator — accepts `dataset.Iterator`, sequential single-sequence processing |
 | XOR convergence under SGD+momentum | `TestFit_SGDMomentum_ConvergesOnXOR` |
-| Loss-decreases smoke test for transformer | `TestTransformer_FitLossDecreases` |
+| Loss-decreases smoke test for transformer | `TestTransformer_FitLossDecreases`, `TestTransformer_FitIterator` |
 
 ### Persistence
 | Area | Notes |
@@ -96,7 +108,6 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 
 | Area | Target | Notes |
 |------|:------:|-------|
-| BPE tokenizer | 2026 Q3 | Required for real text training; the current toy examples use integer token IDs directly. A small `internal/tokenizer/bpe.go` plus a `relux.Tokenizer` type and `LoadVocab` / `Encode` / `Decode` API. |
 | CLI (`cmd/relux`) | 2026 Q3 | `relux train`, `relux generate`, `relux inspect` — drives the public `Transformer` API. Reads v1 .relux files. |
 | Multi-Token Prediction (MTP) loss | 2026 Q3 | Current Transformer.TrainStep does single-token next-token prediction; MTP (predict tokens k+1, k+2, … simultaneously) is the standard richer supervision signal. Drop-in for the loss path. |
 | KV-cache | 2026 Q3 | `internal/transformer/kvcache.go` exists but isn't wired into `Transformer.Generate`; the public API still does the slow per-token prefill. |
@@ -127,6 +138,17 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 
 ## Recent Milestones (reverse chronological)
 
+- **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
+  `tokenizer/` (wraps `sugarme/tokenizer` to load any `tokenizer.json` —
+  BPE, WordPiece, WordLevel — and expose `Encode`, `Decode`,
+  `VocabSize`, BOS/EOS/PAD/UNK). Added `dataset/` with `Iterator`
+  interface and three implementations: `WindowedIterator` (sliding
+  windows over in-memory tokens), `TextFileIterator` (stream text
+  files, tokenize on the fly), `MmapIterator` (read pre-tokenized
+  int32 binary files). Added `Preprocess`/`PreprocessWithSeparators`
+  to build binary token files. Added `Transformer.FitIterator(iter
+  Iterator, ...)` for streaming training with auto-reset multi-epoch.
+  All new tests pass alongside the existing suite.
 - **2026 Q2** — **rnxa compute backend wired for bf16.** Added
   `MatMulFloat32` to `ComputeBackend`; `matmulBatched3D` dispatches
   through it, widening bf16→f32 once per call. `NewTransformer`

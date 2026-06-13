@@ -26,8 +26,8 @@ architectural decisions that shape every line of code.
 - [Hardware Acceleration with rnxa](#-hardware-acceleration-with-rnxa)
 - [Mixed Precision: bf16 Native](#-mixed-precision-bf16-native)
 - [Installation](#-installation)
-- [Quick Start](#-quick-start) — XOR (MLP) and a tiny Transformer
-- [Architecture](#-architecture) — Network, Transformer, modules
+- [Quick Start](#-quick-start) — XOR (MLP), Transformer, streaming pipeline
+- [Architecture](#-architecture) — Network, Transformer, modules, data pipeline
 - [Usage Patterns](#-usage-patterns) — production patterns
 - [Model Persistence](#-model-persistence) — v0 (gob) and v1 (binary)
 - [Configuration](#-configuration)
@@ -387,6 +387,67 @@ func main() {
 }
 ```
 
+### **Streaming Data Pipeline — Tokenizer + Dataset + FitIterator**
+
+For real training runs, use the tokenizer and dataset packages to
+stream tokens from disk rather than holding everything in RAM.
+
+```go
+package main
+
+import (
+    "math/rand"
+    "os"
+    "path/filepath"
+
+    "github.com/xDarkicex/relux"
+    "github.com/xDarkicex/relux/dataset"
+    "github.com/xDarkicex/relux/tokenizer"
+)
+
+func main() {
+    // 1. Load a tokenizer from any HuggingFace tokenizer.json.
+    tok, _ := tokenizer.Load("tokenizer.json")
+
+    // 2. Build a Transformer whose vocab matches the tokenizer.
+    t, _ := relux.NewTransformer(relux.ConfigTransformer{
+        VocabSize:  tok.VocabSize(),
+        DModel:     512,
+        NumHeads:   8,
+        NumKVHeads: 2,
+        NumLayers:  6,
+        DFF:        1024,
+        MaxSeqLen:  1024,
+        Causal:     true,
+    })
+
+    // 3. Collect source files.
+    files, _ := filepath.Glob("corpus/*.go")
+
+    // Option A: In-memory (small datasets).
+    // Tokenize everything, pack into windows, train.
+    var allTokens []int
+    for _, f := range files {
+        data, _ := os.ReadFile(f)
+        ids, _ := tok.Encode(string(data))
+        allTokens = append(allTokens, tok.BOS())
+        allTokens = append(allTokens, ids...)
+        allTokens = append(allTokens, tok.EOS())
+    }
+    it := dataset.NewWindowedIterator(allTokens, 1024, 1, 1)
+    t.FitIterator(it, 5000, 3e-4, nil)
+
+    // Option B: Streaming from text files (medium datasets).
+    it2 := dataset.NewTextFileIterator(files, tok, 1024, 1)
+    t.FitIterator(it2, 5000, 3e-4, rand.New(rand.NewSource(42)))
+
+    // Option C: Pre-tokenized binary (large datasets — tokenize once).
+    dataset.PreprocessWithSeparators(files, tok, "corpus.bin")
+    it3, _ := dataset.NewMmapIterator("corpus.bin", 1024, 1)
+    t.FitIterator(it3, 10000, 3e-4, nil)
+}
+```
+
 ---
 
 ## 🏗 Architecture
@@ -418,6 +479,11 @@ func main() {
   automatically by `NewTransformer`; no caller-side config needed.
 
 ### **Training pipeline**
+- 📥 **Data ingestion**: `tokenizer/` loads any `tokenizer.json`;
+  `dataset/` provides three streaming iterators (in-memory windows,
+  text-file streaming, pre-tokenized binary mmap)
+- 🔄 **Streaming training**: `Transformer.FitIterator` accepts an
+  `Iterator` and trains multi-epoch with auto-reset
 - 🚀 **Adaptive optimization**: Adam (default for transformer), SGD
   with momentum (default for MLP), learning rate scheduling
 - 📊 **Training monitoring**: real-time loss, convergence detection
@@ -996,6 +1062,11 @@ in flight. 🔮 items are scoped but not yet started.
 | **Transformer (decoder-only LLM)** | ✅ | `relux.Transformer`: RoPE, MHA+GQA, RMSNorm, MLP, Linear head, causal mask |
 | Embedding, RMSNorm, LayerNorm | ✅ | `internal/transformer/` — all bf16/f32 |
 | Multi-Head Attention with GQA | ✅ | `internal/transformer/mha.go` — RoPE, causal mask, bf16 matmul |
+| HuggingFace tokenizer loading | ✅ | `tokenizer/` — wraps `sugarme/tokenizer`; `Load(path)` parses any `tokenizer.json` (BPE, WordPiece, WordLevel) |
+| Encode / Decode / special tokens | ✅ | `tokenizer.Tokenizer` — `Encode`, `Decode`, `EncodeWithSpecial`, `VocabSize`, `BOS`/`EOS`/`PAD`/`UNK` |
+| Streaming dataset pipeline | ✅ | `dataset/` — `Iterator` interface + 3 impls: `WindowedIterator`, `TextFileIterator`, `MmapIterator` |
+| Corpus pre-tokenization | ✅ | `dataset.Preprocess`, `PreprocessWithSeparators` → int32 binary files |
+| Transformer streaming training | ✅ | `Transformer.FitIterator(iter Iterator, ...)` — auto-reset multi-epoch |
 | **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
 | v0 .relux (gob) back compat | ✅ | `Network.Load` sniffs magic; dispatches v0/v1 |
 | Optimizer state round-trip | ✅ | Adam m/v preserved losslessly across save/load |
@@ -1007,13 +1078,13 @@ in flight. 🔮 items are scoped but not yet started.
 | Off-heap tensor storage | ✅ | `internal/alloc/` backed by `xDarkicex/memory` |
 | XOR convergence under SGD+momentum | ✅ | `TestFit_SGDMomentum_ConvergesOnXOR` |
 | Transformer Fit loss-decreases | ✅ | `TestTransformer_FitLossDecreases` |
+| Transformer FitIterator loss-decreases | ✅ | `TestTransformer_FitIterator` |
 | Transformer save/load round-trip | ✅ | `TestTransformer_V1EndToEndTraining` |
 
 ### **In Flight**
 
 | Area | Status | Target | Notes |
 |------|:------:|--------|-------|
-| BPE tokenizer | 🔄 | 2026 Q3 | `internal/tokenizer/` — needed for real text training |
 | CLI (`cmd/relux`) | 🔄 | 2026 Q3 | `relux train`, `relux generate`, `relux inspect` |
 | Multi-Token Prediction loss | 🔄 | 2026 Q3 | Richer supervision signal; current is single-token per step |
 | KV-cache wiring | 🔄 | 2026 Q3 | `kvcache.go` exists but `Generate` still does per-token prefill |
@@ -1039,6 +1110,11 @@ in flight. 🔮 items are scoped but not yet started.
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
+  `tokenizer/` (wraps `sugarme/tokenizer`, loads any `tokenizer.json`)
+  and `dataset/` (three `Iterator` implementations: in-memory windows,
+  streaming text files, pre-tokenized binary mmap). Added
+  `Transformer.FitIterator` for streaming multi-epoch training.
 - **2026 Q2** — **rnxa compute backend wired for bf16.** Added
   `MatMulFloat32` to `ComputeBackend`. The `matmulBatched3D` hot path
   widens bf16 weights to f32 once per call and dispatches through the
