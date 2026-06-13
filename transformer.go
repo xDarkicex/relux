@@ -461,8 +461,12 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 	}
 	t.SetMode(transformer.Inference)
 
-	// Create KV-cache (bf16 for memory efficiency) and wire into blocks.
-	cache := transformer.NewKVCache(len(t.blocks), transformer.BFloat16)
+	// Create KV-cache (bf16, pre-allocated for MaxSeqLen) and wire into blocks.
+	cache := transformer.NewKVCacheSized(
+		len(t.blocks), t.config.MaxSeqLen,
+		t.config.NumKVHeads, t.config.DModel/t.config.NumHeads,
+		transformer.BFloat16,
+	)
 	for i, b := range t.blocks {
 		mha := b.BlockMHA()
 		mha.Cache = cache

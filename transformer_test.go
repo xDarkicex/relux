@@ -157,7 +157,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 
 	// Train. The full backward chain is now wired, so the
 	// blocks' params get updated, not just the lmHead.
-	_, err = tr.Fit(dataset, 8, 200, 0.01, nil)
+	_, err = tr.Fit(dataset, 8, 300, 0.02, nil)
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
