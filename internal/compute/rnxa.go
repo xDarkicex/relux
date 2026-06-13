@@ -200,6 +200,33 @@ func (r *rnxaBackend) DeviceInfo() string {
 	return fmt.Sprintf("%s (%d cores, %.1fGB memory)",
 		device.Name, device.Cores, float64(memory.Available)/1e9)
 }
+// MatMulFloat32 computes C = A @ B with A [M, K], B [K, N],
+// both row-major float32. Routes through the rnxa engine
+// (MPS on Apple Silicon, Metal fallback, CUDA on Linux, CPU
+// everywhere). The caller is responsible for widening bf16
+// weights to float32 before calling this method.
+func (r *rnxaBackend) MatMulFloat32(A, B []float32, M, K, N int) ([]float32, error) {
+	if M*K != len(A) || K*N != len(B) {
+		return nil, fmt.Errorf("rnxa MatMulFloat32: dimension mismatch A[%d,%d] B[%d,%d]", M, K, K, N)
+	}
+	// For very small matrices the overhead of GPU dispatch
+	// (memory transfer, kernel launch, sync) dominates the
+	// compute. Let the CPU handle those inline.
+	if M*K*N < 64*64*64 {
+		return nativeMatMulFloat32(A, B, M, K, N)
+	}
+
+	tA := rnxa.NewTensorFromFloat32(A, M, K)
+	tB := rnxa.NewTensorFromFloat32(B, K, N)
+
+	result, err := r.engine.MatMul(r.ctx, tA, tB)
+	if err != nil {
+		return nil, fmt.Errorf("rnxa MatMulFloat32: %w", err)
+	}
+
+	return result.Data32(), nil
+}
+
 func (r *rnxaBackend) Close() error { return r.engine.Close() }
 
 // Helper functions for tensor conversion
@@ -261,4 +288,11 @@ func nativeActivation(name string, x []float64) ([]float64, error) {
 	// Reuse native backend implementation
 	native := newNativeBackend()
 	return native.ActivationFunc(name, x)
+}
+
+// nativeMatMulFloat32 is the pure Go float32 matmul used as a
+// fallback when the rnxa engine is not available or the
+// matrices are too small for GPU dispatch.
+func nativeMatMulFloat32(A, B []float32, M, K, N int) ([]float32, error) {
+	return (&nativeBackend{}).MatMulFloat32(A, B, M, K, N)
 }

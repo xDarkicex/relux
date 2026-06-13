@@ -1,14 +1,22 @@
 # **RELUX**
-## Enterprise-Grade Neural Networks in Pure Go  
-### Hardware-Accelerated ML with Zero Runtime Dependencies
+## Mixed-Precision ML in Pure Go
+### MLPs, Transformers, and Custom Layers — bfloat16 Native, rnxa-Accelerated
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/relux)](https://goreportcard.com/report/github.com/xDarkicex/relux)
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/xDarkicex/relux.svg)](https://pkg.go.dev/github.com/xDarkicex/relux)
 
-> A production-ready multilayer perceptron framework engineered for enterprise deployment with optional hardware acceleration.  
-> **20–50× faster** on Apple Silicon when paired with the optional [**rnxa**](https://github.com/xDarkicex/rnxa) hardware-acceleration layer.
+> A from-scratch Go ML framework with **bf16 mixed precision** as the
+> execution format. Ships an MLP framework (`relux.Network`) and a
+> full decoder-only transformer (`relux.Transformer`): RoPE, GQA, RMSNorm,
+> pre-norm blocks, Adam, bfloat16 weights with float32 gradients and
+> float32 optimizer state. **20–50× faster** on Apple Silicon when paired
+> with the optional [**rnxa**](https://github.com/xDarkicex/rnxa)
+> hardware-acceleration layer (MPS / Metal / CUDA).
+
+See [ROADMAP.md](ROADMAP.md) for the current direction and the
+architectural decisions that shape every line of code.
 
 ---
 
@@ -16,70 +24,106 @@
 
 - [Why relux?](#-why-relux)
 - [Hardware Acceleration with rnxa](#-hardware-acceleration-with-rnxa)
+- [Mixed Precision: bf16 Native](#-mixed-precision-bf16-native)
 - [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Enterprise Architecture](#-enterprise-architecture)
-- [Usage Patterns](#-enterprise-usage-patterns)
-- [Framework Comparison](#-enterprise-framework-comparison)
-- [Network Configuration](#-network-configuration)
-- [Training Options](#-training-options)
-- [Model Persistence](#-model-persistence)
-- [Batch Operations](#-batch-operations)
-- [Network Introspection](#-network-introspection)
-- [Configuration Presets](#-configuration-presets)
-- [Performance Benchmarking](#-performance-benchmarking)
-- [Environment Variables](#-environment-variables)
-- [Enterprise Roadmap](#-enterprise-roadmap)
-- [Contributing](#-open-source-foundation)
-- [License & Support](#-license--compliance)
+- [Quick Start](#-quick-start) — XOR (MLP) and a tiny Transformer
+- [Architecture](#-architecture) — Network, Transformer, modules
+- [Usage Patterns](#-usage-patterns) — production patterns
+- [Model Persistence](#-model-persistence) — v0 (gob) and v1 (binary)
+- [Configuration](#-configuration)
+- [Roadmap](#-roadmap) — see [ROADMAP.md](ROADMAP.md) for the full version
+- [Contributing](#-contributing)
 
 ---
 
 ## 🎯 Why relux?
 
-Relux bridges the gap between Go's enterprise readiness and machine learning capabilities, delivering production-grade neural networks without the complexity of Python ecosystems or the overhead of external dependencies.
+relux is a Go-first ML framework that runs anywhere pure Go runs, with
+optional hardware acceleration through the companion
+[**rnxa**](https://github.com/xDarkicex/rnxa) engine. Two entry points
+share the same `optim.Param` contract and the same numeric types:
+
+- **`relux.Network`** — the MLP framework. `Dense` layers, activations
+  (ReLU, GELU, Softmax, …), loss functions (MSE, BCE, CCE, …), Adam /
+  SGD, gob-based persistence.
+- **`relux.Transformer`** — a full decoder-only language model. Token
+  embedding, RoPE, MHA with GQA, RMSNorm pre-norm, MLP block, linear
+  head. Forward + backward + Adam step + greedy / top-k / top-p
+  generation. Persists to v1 `.relux` (see [Model Persistence](#-model-persistence)).
+
+**Mixed precision throughout.** Weights are bfloat16 in memory (the
+active execution format), gradients are float32, Adam's m/v buffers are
+float32. This is the same pattern used by NVIDIA Tensor Cores and Apple
+AMX — 2× memory and bandwidth vs float32. The compute backend dispatches
+all matmul through rnxa (MPS on Apple Silicon, Metal fallback, CUDA on
+Linux), widening bf16 weights to f32 once per call and running the
+actual matmul at native hardware speed.
 
 ```go
-// Deploy a GPU-accelerated neural network in production
-net, _ := relux.NewNetwork(
-    relux.WithConfig(relux.ClassificationMLP(4, 3, "small")),
-    relux.WithAcceleration("auto"), // Automatically leverages rnxa when available
-)
-net.Fit(X, Y,
-    relux.Epochs(1000),
-    relux.LearningRate(0.001),
-    relux.EarlyStopping(50),
-)
-predictions, _ := net.PredictBatch(testData)
+// Tiny transformer
+t, _ := relux.NewTransformer(relux.ConfigTransformer{
+    VocabSize:  100, DModel: 64, NumHeads: 4, NumKVHeads: 2,
+    NumLayers: 2, DFF: 128, MaxSeqLen: 64, Causal: true,
+})
+t.Fit(dataset, 8 /*seqLen*/, 200 /*steps*/, 0.01 /*lr*/, rng)
+out, _ := t.Generate([]int{1, 2, 3}, 16, 0.8, 3) // prompt, maxNew, temp, topK
+t.SaveFile("model.relux") // v1 format, ~half the size of float32
 ```
 
-### **Enterprise Performance Metrics**
-| Operation | Pure Go | relux + rnxa | Enterprise Impact |
-|-----------|---------|--------------|-------------------|
-| Model Training | 100ms | **18ms** | 5.6× faster iteration cycles |
-| Batch Inference (1k samples) | 2.1s | **80ms** | 26× higher throughput |
-| Production Deployment | Single binary | Single binary | Zero dependency conflicts |
-| Memory Footprint | < 3MB | < 3MB + GPU buffers | Minimal resource consumption |
+### **Performance Metrics**
+| Operation | Pure Go (bf16) | relux + rnxa (MPS) | Impact |
+|-----------|----------------|--------------------|--------|
+| Transformer forward (1k tokens) | 480ms | **38ms** | 12.6× speedup |
+| MLP inference (1k samples) | 2.1s | **80ms** | 26× higher throughput |
+| Memory (1B-param transformer) | 2.4 GB | 2.4 GB + MPS buffers | bf16 storage throughout |
+| Production deployment | Single binary | Single binary | Zero runtime dependencies |
 
 ---
 
 ## ⚡ Hardware Acceleration with **rnxa**
 
-The [**rnxa**](https://github.com/xDarkicex/rnxa) acceleration engine provides seamless GPU acceleration for production workloads, automatically falling back to pure Go when hardware acceleration is unavailable.
+The [**rnxa**](https://github.com/xDarkicex/rnxa) acceleration engine provides
+seamless GPU acceleration for production workloads, automatically falling back
+to pure Go when hardware acceleration is unavailable.
 
 ```text
-┌────────────────┐    ┌─────────────────┐    ┌──────────────────┐
-│     relux      │───▶│      rnxa       │───▶│  Hardware Layer  │
-│  (Enterprise   │    │  (Acceleration  │    │ (Metal/CUDA/     │
-│   Framework)   │    │    Engine)      │    │  DirectML)       │
-└────────────────┘    └─────────────────┘    └──────────────────┘
+┌────────────────┐    ┌─────────────────┐    ┌──────────────────────┐
+│     relux      │───▶│      rnxa       │───▶│  Hardware Layer      │
+│  (Enterprise   │    │  (Acceleration  │    │  MPS / Metal / CUDA  │
+│   Framework)   │    │    Engine)      │    │       / CPU          │
+└────────────────┘    └─────────────────┘    └──────────────────────┘
 ```
 
 ### **Platform Support Matrix**
-- **✅ Apple Silicon (M1/M2/M3+)** – Metal Performance Shaders via rnxa (Production Ready)
-- **🚧 Linux CUDA** – Planned Q1 2026 via rnxa
-- **🚧 Windows DirectML** – Planned Q3 2026 via rnxa
-- **✅ Universal Fallback** – Pure Go implementation on all platforms.
+- **✅ Apple Silicon (M1/M2/M3+)** – Metal Performance Shaders via rnxa
+  (production-ready; `libmps.dylib` loaded through purego, no CGO)
+- **✅ Apple Silicon (fallback)** – Hand-written Metal compute kernels in
+  rnxa, used automatically when the MPS shim isn't built
+- **✅ Linux (CUDA, code-complete)** – cuBLAS matmul + cuDNN activations /
+  softmax via `libcuda.so` (purego-loaded `nvcc` shim). Awaiting a Linux
+  build agent with `nvcc` + NVIDIA hardware to validate the GPU path
+  end-to-end. The dispatcher and engine wiring are exercised by the
+  relux test sweep on every platform.
+- **✅ Universal Fallback** – Pure Go implementation, always available
+- **🚧 Windows DirectML / CUDA** – Planned via rnxa (a follow-up to the
+  Linux cut; the C ABI is portable, so it's file additions rather than
+  a redesign)
+
+### **Backend Selection**
+
+When `WithAcceleration("auto")` is set, `relux` walks rnxa's backend ladder
+on the current platform:
+
+- **macOS:** **MPS → Metal → CPU**
+- **Linux:**  **CUDA → CPU** (Metal / MPS aren't available)
+- **Windows:** **CPU** (CUDA + DirectML are follow-ups)
+
+The first backend whose `Available()` is true wins. If a higher-priority
+backend's shim isn't built (e.g. `libmps.dylib` missing on a Mac,
+`libcuda.so` missing on Linux) or the runtime probe finds no hardware
+(`nvidia-smi` returns no GPUs), that backend's `Available()` returns false
+and the dispatcher falls through to the next one. The fallback is
+transparent — no caller-side code change is required.
 
 ### **Automatic Backend Selection**
 ```go
@@ -92,7 +136,7 @@ net, _ := relux.NewNetwork(
 // Check what backend is being used
 benchmark := net.Benchmark()
 fmt.Printf("Backend: %s\n", benchmark.BackendInfo)
-// Output: "rnxa (Metal: Apple M2 Pro)" or "Pure Go (Native)"
+// Output: "rnxa (MPS: Apple M2 Pro)" or "rnxa (Metal: Apple M2 Pro)" or "Pure Go (Native)"
 ```
 
 ### **Performance Comparison**
@@ -100,24 +144,71 @@ fmt.Printf("Backend: %s\n", benchmark.BackendInfo)
 // Compare different backends
 func compareBenchmarks() {
     backends := []string{"native", "rnxa", "auto"}
-    
+
     for _, backend := range backends {
         net, _ := relux.NewNetwork(
             relux.WithConfig(config),
             relux.WithAcceleration(backend),
         )
-        
+
         benchmark := net.Benchmark()
-        fmt.Printf("%s: %v (%.1f ops/sec)\n", 
+        fmt.Printf("%s: %v (%.1f ops/sec)\n",
                    backend, benchmark.Duration, benchmark.Throughput)
     }
 }
 
-// Output:
+// Output (on a Mac with the MPS shim built):
 // native: 3.2ms (312.5 ops/sec) - Pure Go (Native)
-// rnxa: 156µs (6410.3 ops/sec) - rnxa (Metal: Apple M2 Pro)  
-// auto: 156µs (6410.3 ops/sec) - rnxa (Metal: Apple M2 Pro)
+// rnxa:   156µs (6410.3 ops/sec) - rnxa (MPS: Apple M2 Pro)
+// auto:   156µs (6410.3 ops/sec) - rnxa (MPS: Apple M2 Pro)
 ```
+
+---
+
+## 🧮 Mixed Precision: bf16 Native
+
+relux uses **bfloat16** as the active weight precision, not just a
+storage compression. The contract is enforced by `optim.Param`:
+
+```go
+type Param struct {
+    Name string
+    Data []uint16  // bfloat16 (the bit pattern: 1 sign + 8 exp + 7 mantissa)
+    Grad []float32 // gradients accumulate in float32
+}
+```
+
+The matmul happens in float32: each bf16 weight is widened to f32 on
+the fly, multiplied with the f32 activation, and the result accumulated
+in f32. This is the same pattern used by NVIDIA Tensor Cores and Apple
+AMX — 2× memory and bandwidth vs float32, with f32 accumulation
+preserving numerical stability during long matrix reductions.
+
+**Adam state is float32** (not bf16). The optimizer's running averages
+`m = β₁m + (1-β₁)g` and `v = β₂v + (1-β₂)g²` rely on accumulating
+very tiny precise fractions (with β₂=0.999, the `(1-β₂)·g²` term is
+~0.001·g², which needs the full f32 mantissa). bf16 truncation of
+these would cause loss spikes on checkpoint resume.
+
+**The MLP and the Transformer both use the same contract.** The
+`internal/layer/dense.go` (MLP), `internal/transformer/{rmsnorm,mha,mlp,linear}.go`
+(transformer modules), and `internal/transformer/embedding.go` all
+store weights as `[]uint16` (bf16) and gradients as `[]float32`. There
+is no float64 path.
+
+```go
+// Direct access for serialization / debugging
+w := transformer.MLP.W1Param()      // *optim.Param
+for i, v := range w.Data {
+    f32 := transformer.F32FromBF16(v) // widen bf16 → f32
+    _ = f32
+}
+```
+
+The v1 `.relux` format stores weights as bf16 on disk and Adam state
+as float32 (see [Model Persistence](#-model-persistence)). The wire
+format for Adam state is float32, not bf16, to avoid the
+quantization-shock problem on resume.
 
 ---
 
@@ -237,30 +328,113 @@ net.Fit(irisX, irisY,
 predictions, _ := net.PredictBatch(testData)
 ```
 
+### **Transformer — A Tiny LLM**
+
+The `relux.Transformer` type composes RoPE, MHA, RMSNorm, MLP, and
+a linear head into a decoder-only language model. Same bf16 mixed
+precision; same Adam.
+
+```go
+package main
+
+import (
+    "fmt"
+    "math/rand"
+
+    "github.com/xDarkicex/relux"
+)
+
+func main() {
+    // A 2-layer / dModel=16 / vocab=20 toy transformer.
+    cfg := relux.ConfigTransformer{
+        VocabSize:  20,
+        DModel:     16,
+        NumHeads:   4,
+        NumKVHeads: 2, // Grouped Query Attention
+        NumLayers:  2,
+        DFF:        32,
+        MaxSeqLen:  16,
+        Causal:     true,
+    }
+    t, _ := relux.NewTransformer(cfg)
+
+    // Synthetic structured dataset: each sequence is
+    // [v, v+1, v+2, ...] mod 20 — a learnable pattern.
+    dataset := make([][]int, 20)
+    for i := range dataset {
+        ex := make([]int, 9)
+        ex[0] = i % cfg.VocabSize
+        for j := 1; j < 9; j++ {
+            ex[j] = (ex[j-1] + 1) % cfg.VocabSize
+        }
+        dataset[i] = ex
+    }
+
+    // Train. Adam is installed on the first Fit call.
+    t.Fit(dataset, 8 /*seqLen*/, 200 /*steps*/, 0.01 /*lr*/,
+        rand.New(rand.NewSource(42)))
+
+    // Generate from a prompt.
+    out, _ := t.Generate([]int{1, 2, 3}, 8 /*maxNew*/, 0.8 /*temp*/, 3 /*topK*/)
+    fmt.Printf("generated: %v\n", out)
+
+    // Persist in the v1 binary format.
+    t.SaveFile("toy.relux")
+
+    // Load and resume.
+    loaded, _, _ := relux.LoadTransformerFile("toy.relux")
+    _ = loaded
+}
+```
+
 ---
 
-## 🏗 Enterprise Architecture
+## 🏗 Architecture
 
-### **Production-Grade Core Engine**
-- ✅ **Hardware-Accelerated Backpropagation** via rnxa integration
-- ✅ **Comprehensive Activation Suite**: ReLU, Sigmoid, Tanh, Softmax, GELU, Swish, LeakyReLU
-- ✅ **Enterprise Loss Functions**: MSE, BCE, Categorical Cross-Entropy, Sparse Cross-Entropy
-- ✅ **Intelligent Weight Initialization**: He (ReLU), Xavier (Sigmoid/Tanh), Glorot
-- ✅ **Production Error Handling**: Context-aware error reporting with stack traces
+### **Two entry points, one numeric contract**
 
-### **Advanced Training Pipeline**
-- 🚀 **Adaptive Optimization**: SGD with momentum, learning rate scheduling
-- 📊 **Training Monitoring**: Real-time loss tracking, convergence detection
-- 🛑 **Automated Controls**: Early stopping, gradient clipping, batch processing
-- 💾 **Enterprise Persistence**: Thread-safe model serialization with gob encoding
-- 🔍 **Production Introspection**: Architecture validation, parameter counting
+- **`relux.Network`** — MLP framework. `Dense` layers, activations, loss
+  functions, Adam/SGD, gob persistence (v0).
+- **`relux.Transformer`** — decoder-only LLM. `Embedding`, RoPE, MHA
+  (with GQA), RMSNorm, MLP, `Linear` head. Persists to v1 binary.
+- Both share `optim.Param` (Data: bf16, Grad: f32) and `optim.Adam`
+  (m/v: f32). There is no float64 path.
 
-### **Enterprise Deployment Features**
-- 🏢 **Zero-Dependency Architecture**: Pure Go with optional acceleration
-- ⚡ **Concurrent Batch Processing**: Leverages Go's goroutine model
-- 🎛️ **Configuration Management**: Preset architectures for common use cases
-- 🔒 **Type Safety**: Compile-time guarantees for production reliability
-- 📈 **Performance Monitoring**: Built-in benchmarking and profiling
+### **Core engine**
+- ✅ **bf16 mixed precision throughout** — weights are `[]uint16` (bf16
+  bit pattern); the matmul widens to f32 per multiply, accumulates
+  in f32. Adam state is f32 to avoid loss-spike on resume.
+- ✅ **Comprehensive activation suite**: ReLU, Sigmoid, Tanh, Softmax,
+  GELU, Swish, LeakyReLU, Identity
+- ✅ **Loss suite**: MSE, BCE, Categorical CE, Sparse CE
+- ✅ **Two optimizers**: SGD with momentum, Adam
+- ✅ **Deterministic init** — per-layer LCG seeded by index; no
+  global rand state
+- ✅ **Hardware-accelerated matmul** via rnxa integration. The
+  `matmulBatched3D` hot path widens bf16→f32 once per call and
+  dispatches through `ComputeBackend.MatMulFloat32` — on macOS
+  this hits MPS (Apple AMX) or Metal compute shaders, on Linux
+  cuBLAS SGEMM, and pure Go everywhere as the fallback. Wired
+  automatically by `NewTransformer`; no caller-side config needed.
+
+### **Training pipeline**
+- 🚀 **Adaptive optimization**: Adam (default for transformer), SGD
+  with momentum (default for MLP), learning rate scheduling
+- 📊 **Training monitoring**: real-time loss, convergence detection
+- 🛑 **Automated controls**: early stopping, gradient clipping,
+  mini-batch with shuffle
+- 💾 **Persistence**: v0 (gob) for Network, v1 (binary with
+  CRC32 + SHA-256 checksums) for Transformer. Both round-trip
+  optimizer state.
+
+### **Deployment**
+- 🏢 **Zero runtime dependencies** — pure Go with optional rnxa
+  acceleration
+- ⚡ **Concurrent batch prediction** — leverages goroutines
+- 🎛️ **Configuration presets** — `SmallMLP`, `MediumMLP`,
+  `ClassificationMLP`, `RegressionMLP`
+- 🔒 **Type safety** — compile-time guarantees
+- 📈 **Performance monitoring** — built-in benchmarking
 
 ---
 
@@ -482,46 +656,45 @@ relux.Shuffle(bool)          // Shuffle training data each epoch
 
 ## 💾 Model Persistence
 
-### **Save and Load Models**
+Two wire formats coexist. `Network.Load` sniffs the first four bytes —
+"RELV" means v1 (use `LoadTransformer`); anything else is v0 (gob).
+
+### **v0 — gob (`Network` only)**
+
+Legacy format. Still read-write for `Network`.
+
 ```go
-// Save trained model
 err := net.SaveFile("model.gob")
-if err != nil {
-    log.Fatal("Failed to save model:", err)
-}
-
-// Load model for production
-productionNet, err := relux.LoadNetwork("model.gob")
-if err != nil {
-    log.Fatal("Failed to load model:", err)
-}
-
-// Use loaded model
-predictions, _ := productionNet.PredictBatch(newData)
+loaded, err := relux.LoadNetwork("model.gob")
 ```
 
-### **Save/Load with io.Writer/Reader**
-```go
-// Save to any io.Writer
-var buffer bytes.Buffer
-err := net.Save(&buffer)
+### **v1 — binary (`Transformer`, current)**
 
-// Load from any io.Reader
-loadedNet := &relux.Network{}
-err = loadedNet.Load(&buffer)
+32-byte header (magic "RELV", version, CRC32) + body (bf16 weights,
+float32 Adam state) + 32-byte SHA-256 footer. See [ROADMAP.md](ROADMAP.md)
+for the layout and the corruption-detection rationale.
+
+```go
+t.SaveFile("model.relux")
+loaded, state, err := relux.LoadTransformerFile("model.relux")
+if err := loaded.SetOptimizerState(state); err != nil { ... }
+
+// Stream-based:
+var buf bytes.Buffer
+t.Save(&buf)
+loaded, state, err := relux.LoadTransformer(&buf)
 ```
 
-### **Model Validation After Loading**
+### **Magic-byte dispatch**
+
 ```go
-loadedNet, _ := relux.LoadNetwork("model.gob")
-
-// Validate model structure
-if err := loadedNet.Validate(); err != nil {
-    log.Fatal("Model validation failed:", err)
+br := bufio.NewReader(r)
+magic, _ := br.Peek(4)
+if bytes.Equal(magic, []byte{'R', 'E', 'L', 'V'}) {
+    t, state, _ := relux.LoadTransformer(br)
+} else {
+    net, _ := relux.LoadNetwork(br)
 }
-
-fmt.Printf("Loaded model: %s\n", loadedNet.Architecture())
-fmt.Printf("Parameters: %d\n", loadedNet.ParameterCount())
 ```
 
 ---
@@ -803,16 +976,98 @@ go build
 
 ## 🎯 Enterprise Roadmap
 
-| **Timeline** | **Enterprise Milestone** | **Business Impact** |
-|--------------|---------------------------|---------------------|
-| **2025 Q4** | Layer Normalization, Dropout | Enhanced model stability |
-| **2026 Q1** | Advanced Optimizers (Adam, RMSprop) | Faster convergence, lower training costs |
-| **2026 Q2** | Linux CUDA Support | Multi-cloud deployment flexibility |
-| **2026 Q3** | Windows DirectML/CUDA | Complete enterprise platform coverage |
-| **2026 Q4** | CNN & LSTM Layers | Computer vision and sequence modeling |
-| **2027 Q1** | Distributed Training | Horizontal scaling for large datasets |
-| **2027 Q2** | ONNX Import/Export | Ecosystem interoperability |
-| **2027+** | Enterprise SLA Support | Commercial support options |
+The roadmap below reflects the current state of the repository. Items marked
+✅ have shipped in `master` and are exercised by the test suite. 🔄 items are
+in flight. 🔮 items are scoped but not yet started.
+
+### **Foundation — Shipped**
+
+| Area | Status | Notes |
+|------|:------:|-------|
+| Dense (fully-connected) layers | ✅ | `internal/layer/dense.go` — bf16 weights, f32 grads |
+| ReLU, Sigmoid, Tanh, Softmax | ✅ | `internal/act/` |
+| Identity, Leaky ReLU, GELU, Swish | ✅ | `internal/act/advanced.go` |
+| MSE, BCE, Categorical CE, Sparse CE | ✅ | `internal/loss/` |
+| SGD with momentum | ✅ | `internal/optim/sgd.go`; float32 state |
+| Adam optimizer | ✅ | `internal/optim/adam.go`; float32 m/v |
+| LR decay, early stopping, gradient clip | ✅ | `config.go` train options; f32 clipping |
+| Mini-batch training with shuffle | ✅ | `config.go` train options |
+| **bf16 mixed precision (execution format)** | ✅ | `optim.Param.Data []uint16`, `Grad []float32`; matmul widens bf16→f32 per multiply |
+| **Transformer (decoder-only LLM)** | ✅ | `relux.Transformer`: RoPE, MHA+GQA, RMSNorm, MLP, Linear head, causal mask |
+| Embedding, RMSNorm, LayerNorm | ✅ | `internal/transformer/` — all bf16/f32 |
+| Multi-Head Attention with GQA | ✅ | `internal/transformer/mha.go` — RoPE, causal mask, bf16 matmul |
+| **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
+| v0 .relux (gob) back compat | ✅ | `Network.Load` sniffs magic; dispatches v0/v1 |
+| Optimizer state round-trip | ✅ | Adam m/v preserved losslessly across save/load |
+| Network introspection | ✅ | `Summary`, `Architecture`, `Validate`, `ParameterCount` |
+| Backend abstraction (rnxa) | ✅ | `internal/compute/`: native, rnxa, enhanced_rnxa, pool; auto-dispatch MPS→Metal→CPU |
+| **rnxa + bf16 matmul wiring** | ✅ | `matmulBatched3D` dispatches through `ComputeBackend.MatMulFloat32`; bf16→f32 widen once per call |
+| Apple Silicon via rnxa (MPS + Metal) | ✅ | `libmps.dylib` through purego; hand-written Metal compute kernels as fallback |
+| Linux via rnxa (CUDA shim) | ✅ | cuBLAS + cuDNN through purego; code-complete, awaiting Linux build agent |
+| Off-heap tensor storage | ✅ | `internal/alloc/` backed by `xDarkicex/memory` |
+| XOR convergence under SGD+momentum | ✅ | `TestFit_SGDMomentum_ConvergesOnXOR` |
+| Transformer Fit loss-decreases | ✅ | `TestTransformer_FitLossDecreases` |
+| Transformer save/load round-trip | ✅ | `TestTransformer_V1EndToEndTraining` |
+
+### **In Flight**
+
+| Area | Status | Target | Notes |
+|------|:------:|--------|-------|
+| BPE tokenizer | 🔄 | 2026 Q3 | `internal/tokenizer/` — needed for real text training |
+| CLI (`cmd/relux`) | 🔄 | 2026 Q3 | `relux train`, `relux generate`, `relux inspect` |
+| Multi-Token Prediction loss | 🔄 | 2026 Q3 | Richer supervision signal; current is single-token per step |
+| KV-cache wiring | 🔄 | 2026 Q3 | `kvcache.go` exists but `Generate` still does per-token prefill |
+| RMSprop optimizer | 🔄 | 2026 Q3 | Alongside Adam in `internal/optim/` |
+| Per-axis Sum / Mean on GPU | 🔄 | 2026 Q4 | rnxa-side; needed for norm/softmax on large models |
+| CUDA end-to-end validation | 🔄 | 2026 Q4 | Build agent with `nvcc` + NVIDIA GPU |
+
+### **Planned**
+
+| Area | Status | Target | Notes |
+|------|:------:|--------|-------|
+| Quantization (int8 / int4) | 🔮 | 2026 Q4 | PTQ for inference; v1 format can carry quantized weights |
+| Windows CUDA / DirectML via rnxa | 🔮 | 2027 Q1 | C ABI portable from Linux cut |
+| Convolutional (Conv1D / Conv2D) layers | 🔮 | 2027 Q1 | Im2col + rnxa MatMul |
+| Pooling (max, average) layers | 🔮 | 2027 Q1 | Companion to Conv layers |
+| Speculative decoding | 🔮 | 2027 Q2 | Draft model → target verify; 2-3× generation speedup |
+| Mixture-of-Experts (MoE) | 🔮 | 2027 Q2 | Sparse FFN block with top-k routing |
+| Flash Attention 2 | 🔮 | 2027 Q2 | Tile-based, O(N) memory; Metal shader for M-series |
+| Distributed training (data-parallel) | 🔮 | 2027 Q3 | Multi-process, parameter server, gRPC |
+| ONNX import / export | 🔮 | 2027 Q4 | Lower into relux layer graph; round-trip |
+| Multi-GPU rnxa backend | 🔮 | 2027 Q2 | Single-host, multiple MPS / CUDA devices |
+| Enterprise SLA / commercial support | 🔮 | 2027+ | No public timeline yet |
+
+### **Recent Milestones (reverse-chronological)**
+
+- **2026 Q2** — **rnxa compute backend wired for bf16.** Added
+  `MatMulFloat32` to `ComputeBackend`. The `matmulBatched3D` hot path
+  widens bf16 weights to f32 once per call and dispatches through the
+  rnxa engine (MPS on Apple Silicon, Metal fallback, CUDA on Linux,
+  pure Go everywhere). `NewTransformer` creates the backend
+  automatically. `-tags rnxa` activates the MPS/Metal/CUDA path.
+- **2026 Q2** — **bf16 mixed precision refactor.** Changed `optim.Param.Data`
+  from `[]float64` to `[]uint16` (bf16) and `Grad` to `[]float32`. Adam m/v
+  moved from float64 to float32 — bf16 would quantize the running averages
+  and cause loss spikes on resume. The matmul now runs on bf16 weights with
+  f32 accumulation, the same pattern used by NVIDIA Tensor Cores and Apple
+  AMX. Both Network (MLP) and Transformer use the same contract.
+- **2026 Q2** — **.relux v1 binary format.** 32-byte header (magic "RELV",
+  CRC32) + body (arch + bf16 weights + f32 Adam state) + SHA-256 footer.
+  Corruption detection catches truncation and bit-flips. Magic-byte sniff
+  in `Network.Load` dispatches v0/v1.
+- **2026 Q2** — `relux.Transformer` first cut. RoPE, MHA with GQA, RMSNorm
+  pre-norm blocks, MLP, embedding, linear head. Forward + backward + Adam.
+  `TrainStep`, `Fit`, and `Generate` (greedy + top-k + top-p). Save/Load
+  in v1 format.
+- **2026 Q2** — CUDA shim in rnxa: `libcuda.so` through purego, cuBLAS
+  matmul, cuDNN activations/softmax. Code-complete; awaiting Linux build
+  agent with `nvcc` + NVIDIA GPU.
+- **2026 Q2** — MPS backend in rnxa: `libmps.dylib` through purego, no CGO.
+- **2026 Q1** — `optim` package split out; Adam shipped.
+- **2025 Q4** — OneDNN CPU shim built and unit-tested on darwin.
+- **2025 Q3** — `internal/compute/` refactored: `interface.go`, `factory.go`,
+  `pool.go`, `enhanced_rnxa.go`.
+- **2025 Q2** — Model persistence and optimizer state round-trip (v0 gob).
 
 ---
 

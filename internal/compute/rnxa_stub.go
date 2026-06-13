@@ -5,7 +5,11 @@ package compute
 
 import "fmt"
 
-// Stub implementation when rnxa is not available
+// Stubs for when rnxa is not available.
 func newRnxaBackend() (ComputeBackend, error) {
 	return nil, fmt.Errorf("rnxa backend not available (build with -tags rnxa)")
+}
+
+func newEnhancedRnxaBackend() (ComputeBackend, error) {
+	return nil, fmt.Errorf("enhanced rnxa backend not available (build with -tags rnxa)")
 }

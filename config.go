@@ -9,6 +9,7 @@ import (
 	"github.com/xDarkicex/relux/internal/act"
 	"github.com/xDarkicex/relux/internal/layer"
 	"github.com/xDarkicex/relux/internal/loss"
+	"github.com/xDarkicex/relux/internal/optim"
 )
 
 type InputSpec struct {
@@ -42,6 +43,9 @@ type trainConfig struct {
 	earlyStopping int     // 8
 	shuffle       bool    // 1
 	verbose       bool    // 1 + 6 padding verbose training flag
+
+	// optimizer, if set, overrides the default SGD derived from momentum.
+	optimizer optim.Optimizer
 }
 
 func Epochs(n int) TrainOption {
@@ -124,6 +128,13 @@ func GradientClip(maxNorm float64) TrainOption {
 		}
 		tc.gradClip = maxNorm
 	}
+}
+
+// Optimizer installs a custom parameter optimizer (SGD, Adam, ...). When
+// passed, it overrides the default SGD derived from the legacy Momentum()
+// option. The optimizer persists across Fit calls and save/load round-trips.
+func Optimizer(o optim.Optimizer) TrainOption {
+	return func(tc *trainConfig) { tc.optimizer = o }
 }
 
 // Option is a functional option for configuring a Network.
@@ -269,13 +280,17 @@ func (n *Network) buildFrom(b *builder) error {
 	in := b.cfg.Inputs[0].Size
 
 	// Hidden stack
-	for _, h := range b.cfg.Hidden {
-		layers = append(layers, layer.NewDense(in, h.Units, toActivation(h.Act), b.rnd))
+	for i, h := range b.cfg.Hidden {
+		d := layer.NewDense(in, h.Units, toActivation(h.Act), b.rnd)
+		d.SetLayerID(i)
+		layers = append(layers, d)
 		in = h.Units
 	}
 
 	// Output
-	layers = append(layers, layer.NewDense(in, b.cfg.Output.Units, toActivation(b.cfg.Output.Act), b.rnd))
+	d := layer.NewDense(in, b.cfg.Output.Units, toActivation(b.cfg.Output.Act), b.rnd)
+	d.SetLayerID(len(b.cfg.Hidden))
+	layers = append(layers, d)
 
 	n.layers = layers
 	n.inputSize = b.cfg.Inputs[0].Size

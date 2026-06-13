@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/xDarkicex/relux/internal/act"
+	"github.com/xDarkicex/relux/internal/alloc"
 )
 
 // nativeBackend implements pure Go tensor operations (current relux implementation)
@@ -29,7 +30,7 @@ func (n *nativeBackend) MatMul(A, B [][]float64) ([][]float64, error) {
 	M, K, N := len(A), len(A[0]), len(B[0])
 	C := make([][]float64, M)
 	for i := range C {
-		C[i] = make([]float64, N)
+		C[i] = alloc.Float64(N)
 	}
 
 	// Optimized matrix multiplication with loop reordering
@@ -167,6 +168,22 @@ func (n *nativeBackend) ShouldUseGPUForMatMul(M, N, K int) bool {
 
 func (n *nativeBackend) ShouldUseGPUForActivation(size int) bool {
 	return false // Native backend doesn't use GPU
+}
+
+// MatMulFloat32 computes C = A @ B with A [M, K], B [K, N].
+// Pure Go fallback — used when rnxa is not available.
+func (n *nativeBackend) MatMulFloat32(A, B []float32, M, K, N int) ([]float32, error) {
+	C := alloc.Float32(M * N)
+	for i := 0; i < M; i++ {
+		for j := 0; j < N; j++ {
+			var sum float32
+			for k := 0; k < K; k++ {
+				sum += A[i*K+k] * B[k*N+j]
+			}
+			C[i*N+j] = sum
+		}
+	}
+	return C, nil
 }
 
 func (n *nativeBackend) Name() string       { return n.name }

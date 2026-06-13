@@ -13,3 +13,4 @@ go.sum
 /release/
 .gitingestignore
 *txt
+tmp/

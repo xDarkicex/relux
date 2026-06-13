@@ -70,18 +70,15 @@ func (n *Network) ParameterCount() int {
 	total := 0
 	for _, l := range n.layers {
 		if dense, ok := l.(*layer.Dense); ok {
-			// Weights + biases
-			weights := len(dense.W) * len(dense.W[0])
-			biases := len(dense.B)
-			total += weights + biases
+			total += len(dense.W) + len(dense.B)
 		}
 	}
 	return total
 }
 
-// GetLayerWeights returns the weights and biases for a specific layer.
-// Returns copies to prevent accidental modification.
-func (n *Network) GetLayerWeights(layerIndex int) ([][]float64, []float64, error) {
+// GetLayerWeights returns the weights (reshaped to [][]float64 for caller
+// convenience) and biases for a specific layer. Returns copies.
+func (n *Network) GetLayerWeights(layerIndex int) ([][]float32, []float32, error) {
 	if n == nil || len(n.layers) == 0 {
 		return nil, nil, fmt.Errorf("network not initialized")
 	}
@@ -94,15 +91,20 @@ func (n *Network) GetLayerWeights(layerIndex int) ([][]float64, []float64, error
 		return nil, nil, fmt.Errorf("layer %d is not a Dense layer", layerIndex)
 	}
 
-	// Create deep copies
-	weights := make([][]float64, len(dense.W))
-	for i, row := range dense.W {
-		weights[i] = make([]float64, len(row))
-		copy(weights[i], row)
+	weights := make([][]float32, dense.Out())
+	for j := 0; j < dense.Out(); j++ {
+		row := make([]float32, dense.In())
+		// dense.W is bfloat16 in memory; widen on the fly
+		// for the introspect API which returns float32.
+		for i, w := range dense.W[j*dense.In() : (j+1)*dense.In()] {
+			row[i] = bf16ToFloat32(w)
+		}
+		weights[j] = row
 	}
-
-	biases := make([]float64, len(dense.B))
-	copy(biases, dense.B)
+	biases := make([]float32, len(dense.B))
+	for i, b := range dense.B {
+		biases[i] = bf16ToFloat32(b)
+	}
 
 	return weights, biases, nil
 }
@@ -122,18 +124,16 @@ func (n *Network) Validate() error {
 		return fmt.Errorf("network has no loss function")
 	}
 
-	// Validate layer connectivity
 	expectedInput := n.inputSize
 	for i, l := range n.layers {
 		dense, ok := l.(*layer.Dense)
 		if !ok {
 			return fmt.Errorf("layer %d is not a Dense layer", i)
 		}
-
-		if len(dense.W) == 0 || len(dense.W[0]) != expectedInput {
-			return fmt.Errorf("layer %d has invalid weight dimensions", i)
+		if len(dense.W) != expectedInput*dense.Out() {
+			return fmt.Errorf("layer %d weight buffer has %d elements, expected %d",
+				i, len(dense.W), expectedInput*dense.Out())
 		}
-
 		expectedInput = dense.OutputSize()
 	}
 

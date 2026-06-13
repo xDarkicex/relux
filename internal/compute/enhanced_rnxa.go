@@ -389,6 +389,14 @@ func (e *enhancedRnxaBackend) ShouldUseGPUForActivation(size int) bool {
 	return e.config.ShouldUseGPUForActivation(size)
 }
 
+// MatMulFloat32 is the accelerated matmul — delegates to the
+// base rnxaBackend. The enhanced backend's threshold checks
+// are inherited from the base. The caller is responsible for
+// widening bf16 weights to float32.
+func (e *enhancedRnxaBackend) MatMulFloat32(A, B []float32, M, K, N int) ([]float32, error) {
+	return e.rnxaBackend.MatMulFloat32(A, B, M, K, N)
+}
+
 // Helper function for activation resolution
 func resolveAndApplyActivation(activation string, x float64) float64 {
 	switch activation {

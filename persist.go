@@ -1,6 +1,8 @@
 package relux
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/xDarkicex/relux/internal/layer"
 	"github.com/xDarkicex/relux/internal/loss"
+	"github.com/xDarkicex/relux/internal/optim"
 	"github.com/xDarkicex/relux/internal/serialize"
 )
 
@@ -26,6 +29,7 @@ func (n *Network) Save(w io.Writer) error {
 		func() []layer.Layer { return n.layers },
 		func() int { return n.inputSize },
 		func() string { return n.loss.Name() },
+		func() *optim.State { return n.optimizerState() },
 	)
 
 	encoder := gob.NewEncoder(w)
@@ -35,15 +39,35 @@ func (n *Network) Save(w io.Writer) error {
 	return nil
 }
 
-// Load deserializes a network from an io.Reader using gob encoding.
+// Load deserializes a network from an io.Reader. The first 4
+// bytes are sniffed: if they're the "RELV" v1 magic, the
+// file is rejected (Network is MLP-only and v1 is the
+// transformer format). Otherwise the file is treated as the
+// legacy v0 gob format.
+//
 // The network must be properly initialized before calling Load.
 func (n *Network) Load(r io.Reader) error {
 	if n == nil {
 		return fmt.Errorf("cannot load into nil network")
 	}
 
+	// Peek the first 4 bytes via bufio.Reader.Peek. Peek
+	// does not consume the bytes, so the underlying reader
+	// is unaffected.
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+	}
+	magic, err := br.Peek(4)
+	if err != nil {
+		return fmt.Errorf("load: read magic: %w", err)
+	}
+	if bytes.Equal(magic, []byte{'R', 'E', 'L', 'V'}) {
+		return fmt.Errorf("load: file is v1 .relux (transformer format); use LoadTransformer or Network cannot read v1")
+	}
+
 	var snapshot serialize.NetworkSnapshot
-	decoder := gob.NewDecoder(r)
+	decoder := gob.NewDecoder(br)
 	if err := decoder.Decode(&snapshot); err != nil {
 		return fmt.Errorf("failed to decode network: %w", err)
 	}
@@ -54,6 +78,10 @@ func (n *Network) Load(r io.Reader) error {
 		func(l loss.Loss) { n.loss = l },
 		func(layers []layer.Layer) { n.layers = layers },
 	)
+
+	// Carry the saved optimizer state forward. Fit will apply it on its
+	// next call to whichever optimizer is installed at that point.
+	n.restoredState = snapshot.Optimizer
 
 	return nil
 }
