@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 
 	"github.com/xDarkicex/relux/dataset"
@@ -205,11 +206,11 @@ func (t *Transformer) SetMode(m transformer.Mode) {
 // Transformer is set to Train mode for the duration of
 // the call.
 //
-// The loss is the sum of squared differences between the
-// model's logits and a one-hot target. v1: single-token
-// next-token prediction. MTP (multi-token prediction) is
-// deferred to a follow-up — single-token CE is sufficient
-// for the loss-decreases smoke test.
+// Loss is per-token cross-entropy: loss = -Σ log(softmax(logits_i)[target_i]).
+// The gradient w.r.t. logits is softmax(logits) - onehot(target),
+// which naturally focuses the gradient on the target position.
+// This replaces the earlier MSE-on-logits approach which washed
+// out the gradient signal across the full vocabulary.
 //
 // The full backward chain is:
 //
@@ -239,15 +240,27 @@ func (t *Transformer) TrainStep(input, target []int) (float32, error) {
 		if tgt < 0 || tgt >= vocab {
 			return 0, fmt.Errorf("relux.Transformer.TrainStep: target[%d]=%d out of vocab range", i, tgt)
 		}
-		for j := 0; j < vocab; j++ {
-			want := float32(0)
-			if j == tgt {
-				want = 1
+		base := i * vocab
+		// Log-sum-exp: subtract max for numerical stability.
+		maxVal := logitsData[base]
+		for j := 1; j < vocab; j++ {
+			if logitsData[base+j] > maxVal {
+				maxVal = logitsData[base+j]
 			}
-			d := logitsData[i*vocab+j] - want
-			loss += d * d
-			gradOutData[i*vocab+j] = 2 * d
 		}
+		// Softmax + CE gradient in one pass.
+		var sumExp float32
+		for j := 0; j < vocab; j++ {
+			e := float32(math.Exp(float64(logitsData[base+j] - maxVal)))
+			gradOutData[base+j] = e
+			sumExp += e
+		}
+		invSum := 1.0 / sumExp
+		loss += -float32(math.Log(float64(gradOutData[base+tgt] * invSum)))
+		for j := 0; j < vocab; j++ {
+			gradOutData[base+j] = gradOutData[base+j] * invSum
+		}
+		gradOutData[base+tgt] -= 1.0
 	}
 	gradOut := transformer.NewTensor(gradOutData, 1, seq, vocab)
 

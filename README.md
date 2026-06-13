@@ -332,7 +332,7 @@ predictions, _ := net.PredictBatch(testData)
 
 The `relux.Transformer` type composes RoPE, MHA, RMSNorm, MLP, and
 a linear head into a decoder-only language model. Same bf16 mixed
-precision; same Adam.
+precision; same Adam. Cross-entropy loss with softmax.
 
 ```go
 package main
@@ -467,7 +467,7 @@ func main() {
   in f32. Adam state is f32 to avoid loss-spike on resume.
 - ✅ **Comprehensive activation suite**: ReLU, Sigmoid, Tanh, Softmax,
   GELU, Swish, LeakyReLU, Identity
-- ✅ **Loss suite**: MSE, BCE, Categorical CE, Sparse CE
+- ✅ **Loss suite**: MSE, BCE, Categorical CE, Sparse CE. Transformer uses cross-entropy (softmax + CE) natively.
 - ✅ **Two optimizers**: SGD with momentum, Adam
 - ✅ **Deterministic init** — per-layer LCG seeded by index; no
   global rand state
@@ -1110,6 +1110,7 @@ in flight. 🔮 items are scoped but not yet started.
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. Per-token CE gradient naturally focuses the gradient on the target position; log-sum-exp trick preserves numerical stability for large vocabularies.
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
   `tokenizer/` (wraps `sugarme/tokenizer`, loads any `tokenizer.json`)
   and `dataset/` (three `Iterator` implementations: in-memory windows,

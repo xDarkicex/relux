@@ -71,7 +71,7 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 |------|-------|
 | LR decay, early stopping, gradient clip | `config.go` train options |
 | Mini-batch training with shuffle | `config.go` train options |
-| Training loop with forward + backward + Adam step | Transformer.Fit, Network.Fit |
+| Training loop with forward + backward + Adam step | Transformer.Fit, Network.Fit. Transformer uses softmax + cross-entropy loss. |
 | Streaming training loop | Transformer.FitIterator — accepts `dataset.Iterator`, sequential single-sequence processing |
 | XOR convergence under SGD+momentum | `TestFit_SGDMomentum_ConvergesOnXOR` |
 | Loss-decreases smoke test for transformer | `TestTransformer_FitLossDecreases`, `TestTransformer_FitIterator` |
@@ -138,6 +138,7 @@ The MLP path (`relux.Network`) is the legacy entry point. The new
 
 ## Recent Milestones (reverse chronological)
 
+- **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. The per-token CE gradient naturally focuses on the target position; log-sum-exp preserves numerical stability for large vocabularies (50k+).
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
   `tokenizer/` (wraps `sugarme/tokenizer` to load any `tokenizer.json` —
   BPE, WordPiece, WordLevel — and expose `Encode`, `Decode`,
