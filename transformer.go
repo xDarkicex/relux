@@ -87,6 +87,14 @@ type ConfigTransformer struct {
 	RopeBase   float32
 	NormEps    float32
 	Causal     bool
+
+	// GradientCheckpointing enables activation recomputation
+	// at block boundaries. During forward, intermediate
+	// activations (attention scores, MLP hidden states) are
+	// freed immediately; during backward, each block re-runs
+	// its forward pass to regenerate them. Memory per block
+	// drops to O(batch*seq*dModel) instead of O(seq²).
+	GradientCheckpointing bool
 }
 
 // FitConfig configures a training run via FitIteratorConfig.
@@ -181,7 +189,7 @@ func NewTransformer(cfg ConfigTransformer) (*Transformer, error) {
 	}
 	for i := 0; i < cfg.NumLayers; i++ {
 		t.blocks = append(t.blocks,
-			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal))
+			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, cfg.GradientCheckpointing))
 	}
 	// lmHead: a single linear mapping dModel -> vocabSize.
 	// (We use the Linear primitive, not MLP, because MLP's

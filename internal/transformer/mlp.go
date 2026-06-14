@@ -250,6 +250,18 @@ func (m *MLP) Backward(gradOut *Tensor) *Tensor {
 }
 
 // Params returns W1, b1, W2, b2.
+// freeForwardCache releases the activation cache.
+func (m *MLP) freeForwardCache() {
+	if m.lastX != nil {
+		alloc.Free(m.lastX)
+		alloc.Free(m.lastHpre)
+		alloc.Free(m.lastH)
+		m.lastX = nil
+		m.lastHpre = nil
+		m.lastH = nil
+	}
+}
+
 func (m *MLP) Params() []optim.Param {
 	return []optim.Param{m.W1, m.b1, m.W2, m.b2}
 }

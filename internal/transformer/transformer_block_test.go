@@ -8,7 +8,7 @@ import (
 )
 
 func TestBlock_ForwardShape(t *testing.T) {
-	b := transformer.NewBlock(4, 2, 1, 8, nil, true)
+	b := transformer.NewBlock(4, 2, 1, 8, nil, true, false)
 	x := transformer.NewTensor([]float32{1, 0, 0, 1, 0, 1, 1, 0}, 2, 1, 4)
 	y := b.Forward(x)
 	if y.Rank() != 3 {
@@ -21,7 +21,7 @@ func TestBlock_ForwardShape(t *testing.T) {
 
 func TestBlock_ParamCount(t *testing.T) {
 	// Block has 2 RMSNorms (1 param each) + MHA (4) + MLP (4) = 10 params.
-	b := transformer.NewBlock(4, 2, 1, 8, nil, true)
+	b := transformer.NewBlock(4, 2, 1, 8, nil, true, false)
 	if got := len(b.Params()); got != 10 {
 		t.Errorf("block Params count = %d, want 10", got)
 	}
@@ -36,7 +36,7 @@ func TestBlock_BackwardGradCheck_Wq(t *testing.T) {
 	const dModel, numHeads, numKVHeads, dFF = 4, 2, 1, 8
 	const eps = 0.05
 
-	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true)
+	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, false)
 	xData := []float32{0.5, 1.0, -0.5, 1.0, 0.3, 0.7, -0.3, 0.7}
 	x := transformer.NewTensor(xData, 2, 1, dModel)
 	b.SetMode(transformer.Train)
@@ -93,7 +93,7 @@ func TestBlock_BackwardGradCheck_MlpW1(t *testing.T) {
 	const dModel, numHeads, numKVHeads, dFF = 4, 2, 1, 8
 	const eps = 0.05
 
-	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true)
+	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, false)
 	xData := []float32{0.5, 1.0, -0.5, 1.0, 0.3, 0.7, -0.3, 0.7}
 	x := transformer.NewTensor(xData, 2, 1, dModel)
 	b.SetMode(transformer.Train)
@@ -135,5 +135,60 @@ func TestBlock_BackwardGradCheck_MlpW1(t *testing.T) {
 	numerical := (lp - lm) / (2 * eps)
 	if absDiff(numerical, analytical) > 5e-2 {
 		t.Errorf("mlp.W1.Grad[0]: analytical=%v, numerical=%v", analytical, numerical)
+	}
+}
+
+func TestBlock_GradientCheckpointing(t *testing.T) {
+	dModel := 8
+	numHeads := 4
+	numKVHeads := 2
+	dFF := 16
+
+	// Two identical blocks: one with checkpointing, one without.
+	bNoCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, false)
+	bCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, true)
+
+	// Copy weights.
+	for i, p := range bNoCkpt.Params() {
+		copy(bCkpt.Params()[i].Data, p.Data)
+	}
+
+	// Same input.
+	xData := make([]float32, 1*1*dModel)
+	for i := range xData {
+		xData[i] = float32(i+1) / float32(dModel)
+	}
+	x := transformer.NewTensor(xData, 1, 1, dModel)
+
+	// Forward both.
+	yNo := bNoCkpt.Forward(x.Clone())
+	yCkpt := bCkpt.Forward(x.Clone())
+
+	// Outputs must match.
+	for i, v := range yNo.DataF32() {
+		if v != yCkpt.DataF32()[i] {
+			t.Errorf("forward output[%d] mismatch: noCkpt=%v ckpt=%v", i, v, yCkpt.DataF32()[i])
+			break
+		}
+	}
+
+	// Backward with same gradOut.
+	gradOutData := make([]float32, len(yNo.DataF32()))
+	for i, v := range yNo.DataF32() {
+		gradOutData[i] = 2 * v
+	}
+	bNoCkpt.Backward(transformer.NewTensor(gradOutData, 1, 1, dModel))
+	bCkpt.Backward(transformer.NewTensor(gradOutData, 1, 1, dModel))
+
+	// Gradients must match.
+	for i, pNo := range bNoCkpt.Params() {
+		pCkpt := bCkpt.Params()[i]
+		for j := range pNo.Grad {
+			if pNo.Grad[j] != pCkpt.Grad[j] {
+				t.Errorf("gradient mismatch param %q[%d]: noCkpt=%v ckpt=%v",
+					pNo.Name, j, pNo.Grad[j], pCkpt.Grad[j])
+				break
+			}
+		}
 	}
 }

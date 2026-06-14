@@ -18,14 +18,21 @@ import (
 // each block holds a reference to the same rope.
 //
 // The block's Params() returns all trainable parameters:
-// MHA's 4 projections + MLP's 4 + 2 RMSNorm gammas. Backward
-// calls each sub-module's Backward in reverse order.
+// MHA's 4 projections + MLP's 4 + 2 RMSNorm gammas.
+//
+// Gradient checkpointing: when checkpoint is true, Forward
+// frees submodule activation caches immediately, keeping only
+// lastX (the block input). Backward re-runs the submodule
+// forward passes to regenerate the caches before computing
+// gradients. Memory per block drops from O(seq² + seq×dFF)
+// to O(seq×dModel).
 type Block struct {
 	BaseModule
-	normAttn *RMSNorm
-	mha      *MHA
-	normMlp  *RMSNorm
-	mlp      *MLP
+	normAttn   *RMSNorm
+	mha        *MHA
+	normMlp    *RMSNorm
+	mlp        *MLP
+	checkpoint bool
 
 	// Forward cache for the residual stream (used by
 	// Backward to compute the residual connection's
@@ -38,34 +45,57 @@ type Block struct {
 // NewBlock constructs a single transformer block. rope is
 // shared across all blocks (one RoPE module per model). dFF
 // is typically 4x dModel.
-func NewBlock(dModel, numHeads, numKVHeads, dFF int, rope *RotaryEmbedding, causal bool) *Block {
+func NewBlock(dModel, numHeads, numKVHeads, dFF int, rope *RotaryEmbedding, causal bool, checkpoint bool) *Block {
 	return &Block{
-		normAttn: NewRMSNorm(dModel, 1e-5),
-		mha:      NewMHA(dModel, numHeads, numKVHeads, rope, causal),
-		normMlp:  NewRMSNorm(dModel, 1e-5),
-		mlp:      NewMLP(dModel, dFF),
+		normAttn:   NewRMSNorm(dModel, 1e-5),
+		mha:        NewMHA(dModel, numHeads, numKVHeads, rope, causal),
+		normMlp:    NewRMSNorm(dModel, 1e-5),
+		mlp:        NewMLP(dModel, dFF),
+		checkpoint: checkpoint,
 	}
 }
 
 // Forward computes the block output. Input shape [batch,
 // seq, dModel] -> output shape [batch, seq, dModel].
+//
+// When gradient checkpointing is enabled, submodule activation
+// caches (attention scores, MLP hidden states) are freed after
+// the forward pass; only lastX is retained. Backward will
+// re-run the submodule forwards to regenerate the caches.
 func (b *Block) Forward(x *Tensor) *Tensor {
 	if x.Rank() != 3 || x.shape[2] != 0 {
-		// The dModel check is done inside the submodules.
 		_ = 0
 	}
-	b.lastX = x.Clone() // for the residual
+	b.lastX = x.Clone()
+	b.lastH = x
 
 	normed1 := b.normAttn.Forward(x)
 	attnOut := b.mha.Forward(normed1)
-	b.lastH = x // residual stream: x + attnOut
 	postAttn := residualAdd(x, attnOut)
 
 	normed2 := b.normMlp.Forward(postAttn)
 	mlpOut := b.mlp.Forward(normed2)
 	out := residualAdd(postAttn, mlpOut)
 
+	if b.checkpoint {
+		b.normAttn.freeForwardCache()
+		b.mha.freeForwardCache()
+		b.normMlp.freeForwardCache()
+		b.mlp.freeForwardCache()
+	}
+
 	return out
+}
+
+// recomputeForward re-runs the submodule forward passes from
+// the saved block input to regenerate activation caches.
+func (b *Block) recomputeForward() {
+	x := b.lastX
+	normed1 := b.normAttn.Forward(x)
+	attnOut := b.mha.Forward(normed1)
+	postAttn := residualAdd(x, attnOut)
+	normed2 := b.normMlp.Forward(postAttn)
+	b.mlp.Forward(normed2)
 }
 
 // Backward computes the input gradient. The flow is the
@@ -86,6 +116,12 @@ func (b *Block) Forward(x *Tensor) *Tensor {
 func (b *Block) Backward(gradOut *Tensor) *Tensor {
 	if b.lastX == nil {
 		panic("Block.Backward: Forward must be called first (Mode is not Train?)")
+	}
+
+	// Recompute submodule forward passes if checkpointing
+	// freed the activation caches.
+	if b.checkpoint && b.mha.lastX == nil {
+		b.recomputeForward()
 	}
 
 	// Split the gradient through the second residual add.

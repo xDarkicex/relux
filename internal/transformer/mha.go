@@ -675,6 +675,25 @@ func (m *MHA) Backward(gradOut *Tensor) *Tensor {
 }
 
 // Params returns the four linear projections.
+// freeForwardCache releases the activation cache allocated
+// during Forward. Used by gradient checkpointing.
+func (m *MHA) freeForwardCache() {
+	if m.lastX != nil {
+		alloc.Free(m.lastX)
+		alloc.Free(m.lastQ)
+		alloc.Free(m.lastK)
+		alloc.Free(m.lastV)
+		alloc.Free(m.lastRearranged)
+		alloc.Free(m.lastAttn)
+		m.lastX = nil
+		m.lastQ = nil
+		m.lastK = nil
+		m.lastV = nil
+		m.lastRearranged = nil
+		m.lastAttn = nil
+	}
+}
+
 func (m *MHA) Params() []optim.Param {
 	return []optim.Param{m.Wq, m.Wk, m.Wv, m.Wo}
 }

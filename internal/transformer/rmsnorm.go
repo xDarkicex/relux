@@ -156,6 +156,18 @@ func (r *RMSNorm) Backward(gradOut *Tensor) *Tensor {
 	return gradIn
 }
 
+// freeForwardCache releases the activation cache.
+func (r *RMSNorm) freeForwardCache() {
+	if r.lastX != nil {
+		allocFreeTensor(r.lastX)
+		r.lastX = nil
+	}
+	if r.lastRstd != nil {
+		alloc.Free(r.lastRstd)
+		r.lastRstd = nil
+	}
+}
+
 // Params returns the gamma weight as an optim.Param.
 func (r *RMSNorm) Params() []optim.Param { return []optim.Param{r.gamma} }
 
