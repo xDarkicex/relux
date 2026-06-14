@@ -46,8 +46,9 @@ type MHA struct {
 	Wv optim.Param
 	Wo optim.Param
 
-	Cache    *KVCache // inference-only; nil means no cache
-	LayerIdx int      // which layer this MHA belongs to
+	Cache          *KVCache // inference-only; nil means no cache
+	LayerIdx       int      // which layer this MHA belongs to
+	FlashAttention bool     // use block-tiled O(seq) attention
 
 	// Forward cache (Train mode). Set during Forward,
 	// consumed by Backward, freed at the end of Backward.
@@ -178,26 +179,32 @@ func (m *MHA) Forward(x *Tensor) *Tensor {
 
 	scale := float32(1.0 / math.Sqrt(float64(m.headDim)))
 	attnOut := alloc.Float32(batch * m.numHeads * seqQ * m.headDim)
-	attnWeights := alloc.Float32(batch * m.numHeads * seqQ * seqK)
+	var attnWeights []float32
 
-	for b := 0; b < batch; b++ {
-		for h := 0; h < m.numHeads; h++ {
-			qOff := (b*m.numHeads + h) * seqQ * m.headDim
-			kOff := (b*m.numHeads + h) * seqK * m.headDim
-			vOff := (b*m.numHeads + h) * seqK * m.headDim
-			wOff := (b*m.numHeads + h) * seqQ * seqK
-			oOff := (b*m.numHeads + h) * seqQ * m.headDim
-			matmulFloat32TransB(attnWeights[wOff:wOff+seqQ*seqK], qRearranged[qOff:qOff+seqQ*m.headDim], kRearranged[kOff:kOff+seqK*m.headDim], seqQ, m.headDim, seqK)
-			for i := 0; i < seqQ; i++ {
-				for j := 0; j < seqK; j++ {
-					attnWeights[wOff+i*seqK+j] *= scale
-					if m.causal && j > i {
-						attnWeights[wOff+i*seqK+j] = float32(math.Inf(-1))
+	if m.FlashAttention {
+		flashAttentionForward(qRearranged, kRearranged, vRearranged, attnOut,
+			batch*m.numHeads, seqQ, seqK, m.headDim, scale, m.causal)
+	} else {
+		attnWeights = alloc.Float32(batch * m.numHeads * seqQ * seqK)
+		for b := 0; b < batch; b++ {
+			for h := 0; h < m.numHeads; h++ {
+				qOff := (b*m.numHeads + h) * seqQ * m.headDim
+				kOff := (b*m.numHeads + h) * seqK * m.headDim
+				vOff := (b*m.numHeads + h) * seqK * m.headDim
+				wOff := (b*m.numHeads + h) * seqQ * seqK
+				oOff := (b*m.numHeads + h) * seqQ * m.headDim
+				matmulFloat32TransB(attnWeights[wOff:wOff+seqQ*seqK], qRearranged[qOff:qOff+seqQ*m.headDim], kRearranged[kOff:kOff+seqK*m.headDim], seqQ, m.headDim, seqK)
+				for i := 0; i < seqQ; i++ {
+					for j := 0; j < seqK; j++ {
+						attnWeights[wOff+i*seqK+j] *= scale
+						if m.causal && j > i {
+							attnWeights[wOff+i*seqK+j] = float32(math.Inf(-1))
+						}
 					}
 				}
+				softmaxRows(attnWeights[wOff:wOff+seqQ*seqK], seqQ, seqK)
+				matmulFloat32(attnOut[oOff:oOff+seqQ*m.headDim], attnWeights[wOff:wOff+seqQ*seqK], vRearranged[vOff:vOff+seqK*m.headDim], seqQ, seqK, m.headDim)
 			}
-			softmaxRows(attnWeights[wOff:wOff+seqQ*seqK], seqQ, seqK)
-			matmulFloat32(attnOut[oOff:oOff+seqQ*m.headDim], attnWeights[wOff:wOff+seqQ*seqK], vRearranged[vOff:vOff+seqK*m.headDim], seqQ, seqK, m.headDim)
 		}
 	}
 	alloc.Free(kRearranged)
@@ -214,7 +221,7 @@ func (m *MHA) Forward(x *Tensor) *Tensor {
 		m.lastK = kRearranged
 		m.lastV = vRearranged
 		m.lastRearranged = rearrangedBack
-		m.lastAttn = attnWeights
+		m.lastAttn = attnWeights // nil when FlashAttention is on
 		m.lastInSeqLen = seqQ
 	} else {
 		alloc.Free(xData)
@@ -222,7 +229,9 @@ func (m *MHA) Forward(x *Tensor) *Tensor {
 		alloc.Free(kRearranged)
 		alloc.Free(vRearranged)
 		alloc.Free(rearrangedBack)
-		alloc.Free(attnWeights)
+		if attnWeights != nil {
+			alloc.Free(attnWeights)
+		}
 	}
 
 	return out
@@ -434,6 +443,30 @@ func (m *MHA) Backward(gradOut *Tensor) *Tensor {
 	// dV[b, h, j, k] = sum_i attnW[b, h, i, j] * dAttnOut[b, h, i, k]
 	dAttnW := alloc.Float32(batch * m.numHeads * seq * seq)
 	dV_postGQA := alloc.Float32(batch * m.numHeads * seq * headDim)
+
+	// Recompute attention weights if flash attention was used
+	// (lastAttn is nil — forward used the O(seq) path).
+	if m.lastAttn == nil {
+		m.lastAttn = alloc.Float32(batch * m.numHeads * seq * seq)
+		for b := 0; b < batch; b++ {
+			for h := 0; h < m.numHeads; h++ {
+				qOff := (b*m.numHeads + h) * seq * m.headDim
+				kOff := (b*m.numHeads + h) * seq * m.headDim
+				wOff := (b*m.numHeads + h) * seq * seq
+				matmulFloat32TransB(m.lastAttn[wOff:wOff+seq*seq], m.lastQ[qOff:qOff+seq*m.headDim], m.lastK[kOff:kOff+seq*m.headDim], seq, m.headDim, seq)
+				for i := 0; i < seq; i++ {
+					for j := 0; j < seq; j++ {
+						m.lastAttn[wOff+i*seq+j] *= scale
+						if m.causal && j > i {
+							m.lastAttn[wOff+i*seq+j] = float32(math.Inf(-1))
+						}
+					}
+				}
+				softmaxRows(m.lastAttn[wOff:wOff+seq*seq], seq, seq)
+			}
+		}
+	}
+
 	for b := 0; b < batch; b++ {
 		for h := 0; h < m.numHeads; h++ {
 			dAOff := (b*m.numHeads + h) * seq * headDim
@@ -684,7 +717,9 @@ func (m *MHA) freeForwardCache() {
 		alloc.Free(m.lastK)
 		alloc.Free(m.lastV)
 		alloc.Free(m.lastRearranged)
-		alloc.Free(m.lastAttn)
+		if m.lastAttn != nil {
+			alloc.Free(m.lastAttn)
+		}
 		m.lastX = nil
 		m.lastQ = nil
 		m.lastK = nil

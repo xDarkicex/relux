@@ -95,6 +95,13 @@ type ConfigTransformer struct {
 	// its forward pass to regenerate them. Memory per block
 	// drops to O(batch*seq*dModel) instead of O(seq²).
 	GradientCheckpointing bool
+
+	// FlashAttention enables the block-tiled Flash Attention 2
+	// algorithm in MHA. Forward uses O(Br×Bc) memory instead of
+	// O(seq²); backward recomputes attention weights on-the-fly.
+	// Block sizes Br=Bc=64. Combine with GradientCheckpointing
+	// for maximum memory savings.
+	FlashAttention bool
 }
 
 // FitConfig configures a training run via FitIteratorConfig.
@@ -189,7 +196,7 @@ func NewTransformer(cfg ConfigTransformer) (*Transformer, error) {
 	}
 	for i := 0; i < cfg.NumLayers; i++ {
 		t.blocks = append(t.blocks,
-			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, cfg.GradientCheckpointing))
+			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, cfg.GradientCheckpointing, cfg.FlashAttention))
 	}
 	// lmHead: a single linear mapping dModel -> vocabSize.
 	// (We use the Linear primitive, not MLP, because MLP's
