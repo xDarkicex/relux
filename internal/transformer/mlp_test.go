@@ -7,7 +7,7 @@ import (
 )
 
 func TestMLP_ForwardShape(t *testing.T) {
-	m := transformer.NewMLP(4, 8)
+	m := transformer.NewMLP(4, 8, transformer.FFNGELU)
 	x := transformer.NewTensor([]float32{1, 2, 3, 4, 5, 6, 7, 8}, 2, 1, 4)
 	y := m.Forward(x)
 	if y.Rank() != 3 {
@@ -19,7 +19,7 @@ func TestMLP_ForwardShape(t *testing.T) {
 }
 
 func TestMLP_ParamCount(t *testing.T) {
-	m := transformer.NewMLP(4, 8)
+	m := transformer.NewMLP(4, 8, transformer.FFNGELU)
 	// W1 is 4*8=32, b1 is 8, W2 is 8*4=32, b2 is 4. Total 76.
 	want := 32 + 8 + 32 + 4
 	if got := len(m.Params()[0].Data) + len(m.Params()[1].Data) + len(m.Params()[2].Data) + len(m.Params()[3].Data); got != want {
@@ -33,7 +33,7 @@ func TestMLP_GELUExactValues(t *testing.T) {
 	// gelu(-1) = -0.5 * (1 - 0.6827) = -0.1587
 	// We don't expose the helper directly; this is checked
 	// indirectly via the forward pass with hand-picked inputs.
-	m := transformer.NewMLP(1, 1)
+	m := transformer.NewMLP(1, 1, transformer.FFNGELU)
 	// W1 = I_1, b1 = 0, W2 = I_1, b2 = 0. The MLP becomes
 	// gelu(x) -> y = gelu(x). Set by overriding the params.
 	for i := range m.Params()[0].Data {
@@ -65,7 +65,7 @@ func TestMLP_BackwardGradCheck(t *testing.T) {
 	const dModel, dFF = 2, 4
 	const eps = 0.05
 
-	m := transformer.NewMLP(dModel, dFF)
+	m := transformer.NewMLP(dModel, dFF, transformer.FFNGELU)
 	xData := []float32{0.5, 1.0, -0.5, 1.0, 0.3, 0.7, -0.3, 0.7}
 	x := transformer.NewTensor(xData, 2, 2, dModel)
 	m.SetMode(transformer.Train)
@@ -110,7 +110,7 @@ func TestMLP_BackwardGradCheck_Bias(t *testing.T) {
 	const dModel, dFF = 2, 4
 	const eps = 0.05
 
-	m := transformer.NewMLP(dModel, dFF)
+	m := transformer.NewMLP(dModel, dFF, transformer.FFNGELU)
 	xData := []float32{0.5, 1.0, -0.5, 1.0}
 	x := transformer.NewTensor(xData, 1, 2, dModel)
 	m.SetMode(transformer.Train)

@@ -43,16 +43,16 @@ type Block struct {
 }
 
 // NewBlock constructs a single transformer block. rope is
-// shared across all blocks (one RoPE module per model). dFF
-// is typically 4x dModel.
-func NewBlock(dModel, numHeads, numKVHeads, dFF int, rope *RotaryEmbedding, causal bool, checkpoint bool, flashAttention bool) *Block {
+// shared across all blocks (one RoPE module per model).
+// ffnType selects the feedforward variant (FFNGELU or FFNSwiGLU).
+func NewBlock(dModel, numHeads, numKVHeads, dFF int, rope *RotaryEmbedding, causal bool, ffnType FFNType, checkpoint bool, flashAttention bool) *Block {
 	mha := NewMHA(dModel, numHeads, numKVHeads, rope, causal)
 	mha.FlashAttention = flashAttention
 	return &Block{
 		normAttn:   NewRMSNorm(dModel, 1e-5),
 		mha:        mha,
 		normMlp:    NewRMSNorm(dModel, 1e-5),
-		mlp:        NewMLP(dModel, dFF),
+		mlp:        NewMLP(dModel, dFF, ffnType),
 		checkpoint: checkpoint,
 	}
 }

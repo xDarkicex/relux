@@ -102,6 +102,12 @@ type ConfigTransformer struct {
 	// Block sizes Br=Bc=64. Combine with GradientCheckpointing
 	// for maximum memory savings.
 	FlashAttention bool
+
+	// FFNType selects the feedforward variant. "gelu" (default)
+	// uses the standard 2-layer MLP with GELU. "swiglu" uses
+	// SwiGLU: (SiLU(xW_up) ⊙ xW_gate) W_down — the standard
+	// FFN in LLaMA 2/3, Mistral, and DeepSeek.
+	FFNType string
 }
 
 // FitConfig configures a training run via FitIteratorConfig.
@@ -194,9 +200,13 @@ func NewTransformer(cfg ConfigTransformer) (*Transformer, error) {
 		rope:       rope,
 		backend:    backend,
 	}
+	ffnType := transformer.FFNGELU
+	if cfg.FFNType == "swiglu" {
+		ffnType = transformer.FFNSwiGLU
+	}
 	for i := 0; i < cfg.NumLayers; i++ {
 		t.blocks = append(t.blocks,
-			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, cfg.GradientCheckpointing, cfg.FlashAttention))
+			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, ffnType, cfg.GradientCheckpointing, cfg.FlashAttention))
 	}
 	// lmHead: a single linear mapping dModel -> vocabSize.
 	// (We use the Linear primitive, not MLP, because MLP's
