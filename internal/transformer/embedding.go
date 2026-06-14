@@ -54,31 +54,36 @@ func NewEmbedding(vocabSize, dModel int) *Embedding {
 	}
 }
 
-// Forward takes a flat slice of token IDs and returns a
-// [seqLen, dModel] tensor (seqLen = len(ids)). Each row i of
-// the output is a copy of `weight[ids[i], :]` widened from
-// bf16 to float32.
-func (e *Embedding) Forward(ids []int) *Tensor {
+// Forward takes flat token IDs and batchSize and returns a
+// [batchSize, seqLen, dModel] tensor (seqLen = len(ids)/batchSize).
+// Each row [b, s, :] is weight[ids[b*seqLen+s], :] widened bf16→f32.
+func (e *Embedding) Forward(ids []int, batchSize int) *Tensor {
 	for _, id := range ids {
 		if id < 0 || id >= e.vocabSize {
 			panic(fmt.Sprintf("Embedding.Forward: token id %d out of range [0, %d)", id, e.vocabSize))
 		}
 	}
-	seqLen := len(ids)
-	out := ZerosF32(seqLen, e.dModel)
-	for i, id := range ids {
-		src := id * e.dModel
-		dst := i * e.dModel
-		for j := 0; j < e.dModel; j++ {
-			out.DataF32()[dst+j] = F32FromBF16(e.weight.Data[src+j])
+	if len(ids)%batchSize != 0 {
+		panic(fmt.Sprintf("Embedding.Forward: len(ids)=%d not divisible by batchSize=%d", len(ids), batchSize))
+	}
+	seqLen := len(ids) / batchSize
+	out := ZerosF32(batchSize, seqLen, e.dModel)
+	for b := 0; b < batchSize; b++ {
+		for i := 0; i < seqLen; i++ {
+			id := ids[b*seqLen+i]
+			src := id * e.dModel
+			dst := (b*seqLen + i) * e.dModel
+			for j := 0; j < e.dModel; j++ {
+				out.DataF32()[dst+j] = F32FromBF16(e.weight.Data[src+j])
+			}
 		}
 	}
 
 	if e.Mode() == Train {
-		if e.lastIDs == nil || cap(e.lastIDs) < seqLen {
-			e.lastIDs = make([]int, seqLen)
+		if e.lastIDs == nil || cap(e.lastIDs) < len(ids) {
+			e.lastIDs = make([]int, len(ids))
 		}
-		e.lastIDs = e.lastIDs[:seqLen]
+		e.lastIDs = e.lastIDs[:len(ids)]
 		copy(e.lastIDs, ids)
 	}
 
@@ -86,21 +91,20 @@ func (e *Embedding) Forward(ids []int) *Tensor {
 }
 
 // Backward scatters the per-row gradient into weight.Grad.
-// `gradOut` has shape [seqLen, dModel] (matching Forward's
-// output). For each row i, we add gradOut[i, :] to
-// weight.Grad[ids[i], :]. The gradOut is float32 (the
-// active dtype); weight.Grad is float32 (per the
-// optim.Param.Grad contract).
+// `gradOut` has shape [batchSize, seqLen, dModel].
+// For each position [b, s, :], the gradient is added to
+// weight.Grad[ids[b*seqLen+s], :].
 func (e *Embedding) Backward(gradOut *Tensor) *Tensor {
 	if e.lastIDs == nil {
 		panic("Embedding.Backward: Forward must be called first (Mode is not Train?)")
 	}
-	if gradOut.Rank() != 2 || gradOut.shape[1] != e.dModel {
-		panic(fmt.Sprintf("Embedding.Backward: shape %v, want [seqLen, %d]", gradOut.shape, e.dModel))
+	if gradOut.Rank() != 3 || gradOut.shape[2] != e.dModel {
+		panic(fmt.Sprintf("Embedding.Backward: shape %v, want [batchSize, seqLen, %d]", gradOut.shape, e.dModel))
 	}
-	seqLen := gradOut.shape[0]
-	if seqLen != len(e.lastIDs) {
-		panic(fmt.Sprintf("Embedding.Backward: gradOut seqLen=%d, Forward saw %d", seqLen, len(e.lastIDs)))
+	batchSize := gradOut.shape[0]
+	seqLen := gradOut.shape[1]
+	if batchSize*seqLen != len(e.lastIDs) {
+		panic(fmt.Sprintf("Embedding.Backward: gradOut total=%d, Forward saw %d", batchSize*seqLen, len(e.lastIDs)))
 	}
 	gData, _ := gradOut.ToF32()
 	for i, id := range e.lastIDs {
@@ -110,7 +114,6 @@ func (e *Embedding) Backward(gradOut *Tensor) *Tensor {
 			e.weight.Grad[dst+j] += gData[src+j]
 		}
 	}
-	// Embedding has no input gradient (it IS the input).
 	return nil
 }
 

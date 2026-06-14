@@ -158,26 +158,24 @@ func (t *Transformer) Params() []optim.Param {
 	return out
 }
 
-// Forward returns the logits for a single training step
-// with the given input token IDs. The output shape is
-// [seq, vocabSize] in float32.
+// Forward returns logits for batched token IDs. tokens is
+// flat [batchSize, seqLen]; batchSize may be 1 for single-
+// sequence inference. Output shape is [batchSize, seqLen,
+// vocabSize].
 //
-// The Transformer preserves the current mode. Callers
-// should call SetMode(Train) before training and
-// SetMode(Inference) before generation.
-func (t *Transformer) Forward(tokens []int) *transformer.Tensor {
-	// 1. Embed
-	h := t.embed.Forward(tokens)
-	// h is shape [seq, dModel]. MHA/Block want [batch,
-	// seq, dModel] with batch=1.
-	h3D := h.Reshape(1, len(tokens), t.config.DModel)
+// The Transformer preserves the current mode. Callers should
+// call SetMode(Train) before training and SetMode(Inference)
+// before generation.
+func (t *Transformer) Forward(tokens []int, batchSize int) *transformer.Tensor {
+	// 1. Embed → [batchSize, seqLen, dModel]
+	h3D := t.embed.Forward(tokens, batchSize)
 	// 2. Blocks
 	for _, b := range t.blocks {
 		h3D = b.Forward(h3D)
 	}
 	// 3. Final norm
 	h3D = t.finalNorm.Forward(h3D)
-	// 4. lmHead: shape [1, seq, vocabSize]
+	// 4. lmHead: shape [batchSize, seqLen, vocabSize]
 	logits := t.lmHead.Forward(h3D)
 	return logits
 }
@@ -221,34 +219,36 @@ func (t *Transformer) SetMode(m transformer.Mode) {
 // Each module's Backward returns its input gradient; the
 // caller (Fit, or the user) is expected to step the
 // optimizer afterwards.
-func (t *Transformer) TrainStep(input, target []int) (float32, error) {
+func (t *Transformer) TrainStep(input, target []int, batchSize int) (float32, error) {
 	if len(input) != len(target) {
 		return 0, fmt.Errorf("relux.Transformer.TrainStep: input len %d != target len %d", len(input), len(target))
 	}
 	if len(input) == 0 {
 		return 0, errors.New("relux.Transformer.TrainStep: empty input")
 	}
-	t.setMode(transformer.Train)
-	logits := t.Forward(input)
-	logitsData, _ := logits.ToF32()
-	seq := len(input)
+	if len(input)%batchSize != 0 {
+		return 0, fmt.Errorf("relux.Transformer.TrainStep: len(input)=%d not divisible by batchSize=%d", len(input), batchSize)
+	}
+	seq := len(input) / batchSize
 	vocab := t.config.VocabSize
+	t.setMode(transformer.Train)
+	logits := t.Forward(input, batchSize)
+	logitsData, _ := logits.ToF32()
 	var loss float32
-	gradOutData := make([]float32, seq*vocab)
-	for i := 0; i < seq; i++ {
+	totalTokens := batchSize * seq
+	gradOutData := make([]float32, totalTokens*vocab)
+	for i := 0; i < totalTokens; i++ {
 		tgt := target[i]
 		if tgt < 0 || tgt >= vocab {
 			return 0, fmt.Errorf("relux.Transformer.TrainStep: target[%d]=%d out of vocab range", i, tgt)
 		}
 		base := i * vocab
-		// Log-sum-exp: subtract max for numerical stability.
 		maxVal := logitsData[base]
 		for j := 1; j < vocab; j++ {
 			if logitsData[base+j] > maxVal {
 				maxVal = logitsData[base+j]
 			}
 		}
-		// Softmax + CE gradient in one pass.
 		var sumExp float32
 		for j := 0; j < vocab; j++ {
 			e := float32(math.Exp(float64(logitsData[base+j] - maxVal)))
@@ -262,22 +262,17 @@ func (t *Transformer) TrainStep(input, target []int) (float32, error) {
 		}
 		gradOutData[base+tgt] -= 1.0
 	}
-	gradOut := transformer.NewTensor(gradOutData, 1, seq, vocab)
+	gradOut := transformer.NewTensor(gradOutData, batchSize, seq, vocab)
 
-	// Full backward chain. Each module's Backward returns
-	// the gradient w.r.t. its input; we thread that into
-	// the next module's Backward. The embed was called
-	// with a 2D [seq, dModel] input (see Forward above),
-	// so we reshape the 3D gradOut from the first block
-	// back to 2D before passing to embed.Backward.
+	// Full backward chain. Embed now outputs [batchSize, seq, dModel]
+	// directly, so Backward receives the same 3D shape.
 	gradOut = t.lmHead.Backward(gradOut)
 	gradOut = t.finalNorm.Backward(gradOut)
 	for i := len(t.blocks) - 1; i >= 0; i-- {
 		gradOut = t.blocks[i].Backward(gradOut)
 	}
-	// gradOut is [1, seq, dModel]; squeeze the batch dim.
-	gradOut2D := gradOut.Reshape(seq, t.config.DModel)
-	t.embed.Backward(gradOut2D) // returns nil (no input grad)
+	// gradOut is [batchSize, seq, dModel]; embed.Backward accepts 3D.
+	t.embed.Backward(gradOut)
 	return loss, nil
 }
 
@@ -345,7 +340,7 @@ func (t *Transformer) Fit(dataset [][]int, seqLen int, steps int, lr float32, rn
 		// Forward + backward (TrainStep populates the
 		// gradients through the full module chain:
 		// lmHead -> finalNorm -> blocks -> embed).
-		loss, err := t.TrainStep(input, target)
+		loss, err := t.TrainStep(input, target, 1)
 		if err != nil {
 			return totalLoss, err
 		}
@@ -424,28 +419,32 @@ func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, 
 		} else if err != nil {
 			return totalLoss / float32(max(validSteps, 1)), err
 		}
-		// Process each sequence in the batch one at a time.
-		for i := range batch.Input {
-			input := batch.Input[i]
-			target := batch.Target[i]
-			// Zero gradients.
-			for _, p := range t.Params() {
-				for j := range p.Grad {
-					p.Grad[j] = 0
-				}
+		// Flatten batch into single call.
+		bSize := len(batch.Input)
+		seqLen := len(batch.Input[0])
+		flatInput := make([]int, bSize*seqLen)
+		flatTarget := make([]int, bSize*seqLen)
+		for bi := 0; bi < bSize; bi++ {
+			copy(flatInput[bi*seqLen:], batch.Input[bi])
+			copy(flatTarget[bi*seqLen:], batch.Target[bi])
+		}
+		// Zero gradients.
+		for _, p := range t.Params() {
+			for j := range p.Grad {
+				p.Grad[j] = 0
 			}
-			loss, err := t.TrainStep(input, target)
-			if err != nil {
-				return totalLoss / float32(max(validSteps, 1)), err
-			}
-			optim.ClipGradNorm(t.Params(), 1.0)
-			t.adam.Step(t.Params())
-			totalLoss += loss
-			validSteps++
-			if onStep != nil {
-				ppl := float32(math.Exp(float64(loss / float32(len(input)))))
-				onStep(validSteps, loss, ppl)
-			}
+		}
+		loss, err := t.TrainStep(flatInput, flatTarget, bSize)
+		if err != nil {
+			return totalLoss / float32(max(validSteps, 1)), err
+		}
+		optim.ClipGradNorm(t.Params(), 1.0)
+		t.adam.Step(t.Params())
+		totalLoss += loss
+		validSteps++
+		if onStep != nil {
+			ppl := float32(math.Exp(float64(loss / float32(bSize*seqLen))))
+			onStep(validSteps, loss, ppl)
 		}
 	}
 	t.optimState = stateFromAdam(t.adam)
@@ -510,7 +509,7 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 	}()
 
 	// Prefill: compute + cache K/V for the full prompt.
-	prefillLogits := t.Forward(prompt)
+	prefillLogits := t.Forward(prompt, 1)
 	prefillData, _ := prefillLogits.ToF32()
 	vocab := prefillLogits.Shape()[2]
 	lastPos := len(prompt) - 1
@@ -519,7 +518,7 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 
 	// Decode loop: one token at a time from the cache.
 	for i := 1; i < maxNew; i++ {
-		logits := t.Forward([]int{next})
+		logits := t.Forward([]int{next}, 1)
 		logitsData, _ := logits.ToF32()
 		next = sampler.Sample(logitsData[:vocab])
 		out = append(out, next)

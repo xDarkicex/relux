@@ -73,7 +73,7 @@ func TestTransformer_ForwardShape(t *testing.T) {
 	}
 	// 4-token prompt.
 	tokens := []int{1, 2, 3, 4}
-	logits := tr.Forward(tokens)
+	logits := tr.Forward(tokens, 1)
 	if logits.Rank() != 3 {
 		t.Errorf("logits.Rank() = %d, want 3", logits.Rank())
 	}
@@ -139,7 +139,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 	// Measure average loss over 50 sequences before training.
 	var initialAvg float32
 	for i := 0; i < 50; i++ {
-		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:], 1)
 		if err != nil {
 			t.Fatalf("initial TrainStep: %v", err)
 		}
@@ -154,7 +154,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 	// Measure average loss over 50 sequences after training.
 	var finalAvg float32
 	for i := 0; i < 50; i++ {
-		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:], 1)
 		if err != nil {
 			t.Fatalf("final TrainStep: %v", err)
 		}
@@ -197,7 +197,7 @@ func TestTransformer_V1RoundTrip(t *testing.T) {
 	// Capture pre-save forward output.
 	tokens := []int{1, 2, 3, 4}
 	tr.SetMode(transformer.Inference)
-	preLogits := tr.Forward(tokens)
+	preLogits := tr.Forward(tokens, 1)
 	preData, _ := preLogits.ToF32()
 	// Save.
 	var buf bytes.Buffer
@@ -238,7 +238,7 @@ func TestTransformer_V1RoundTrip(t *testing.T) {
 	// expected. The logit magnitudes compound that error,
 	// so we use a 1e-3 absolute tolerance.
 	loaded.SetMode(transformer.Inference)
-	postLogits := loaded.Forward(tokens)
+	postLogits := loaded.Forward(tokens, 1)
 	postData, _ := postLogits.ToF32()
 	if len(preData) != len(postData) {
 		t.Fatalf("logits len mismatch: %d vs %d", len(preData), len(postData))
@@ -383,7 +383,7 @@ func TestTransformer_FitIterator(t *testing.T) {
 
 	var initialAvg float32
 	for i := 0; i < 50; i++ {
-		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:], 1)
 		if err != nil {
 			t.Fatalf("initial TrainStep: %v", err)
 		}
@@ -408,7 +408,7 @@ func TestTransformer_FitIterator(t *testing.T) {
 
 	var finalAvg float32
 	for i := 0; i < 50; i++ {
-		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:], 1)
 		if err != nil {
 			t.Fatalf("final TrainStep: %v", err)
 		}
