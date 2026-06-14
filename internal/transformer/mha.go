@@ -783,8 +783,22 @@ func rearrangeBHSN(src []float32, batch, numHeads, seq, headDim int) []float32 {
 	return out
 }
 
+// fastexp32 computes exp(x) using a pure-float32 bit-level
+// approximation. Accurate to ~2% relative error for |x| < 20.
+func fastexp32(x float32) float32 {
+	if x < -87 {
+		return 0
+	}
+	if x > 87 {
+		return math.Float32frombits(0x7F800000) // +Inf
+	}
+	const factor float32 = float32(1<<23) / 0.6931471805599453
+	const bias float32 = 127.0*float32(1<<23) - 405000
+	return math.Float32frombits(uint32(int32(factor*x + bias)))
+}
+
 // softmaxRows applies softmax row-by-row to a [rows, cols]
-// matrix in place.
+// matrix in place, using a fast float32 exp approximation.
 func softmaxRows(m []float32, rows, cols int) {
 	for r := 0; r < rows; r++ {
 		row := m[r*cols : (r+1)*cols]
@@ -796,10 +810,15 @@ func softmaxRows(m []float32, rows, cols int) {
 		}
 		var sum float32
 		for j, v := range row {
-			row[j] = float32(math.Exp(float64(v - maxV)))
+			diff := v - maxV
+			if diff < -20 {
+				row[j] = 0
+			} else {
+				row[j] = fastexp32(diff)
+			}
 			sum += row[j]
 		}
-		invSum := 1.0 / sum
+		invSum := float32(1.0) / sum
 		for j := range row {
 			row[j] *= invSum
 		}
