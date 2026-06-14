@@ -1131,6 +1131,7 @@ in flight. 🔮 items are scoped but not yet started.
 | **Gradient checkpointing** | ✅ | `ConfigTransformer.GradientCheckpointing` — activation recompute at block boundaries |
 | **Fast CE loss kernel** | ✅ | Fused softmax+CE with pure-float32 exp approximation, avoids f64 conversion |
 | **Fast attention softmax** | ✅ | Same fastexp32 kernel in MHA softmaxRows, both forward and KV-cached paths |
+| **SwiGLU FFN** | ✅ | `ConfigTransformer.FFNType: "swiglu"` — SiLU-gated FFN for LLaMA/Mistral/DeepSeek architectures |
 | **Flash Attention 2** | ✅ | `ConfigTransformer.FlashAttention` — block-tiled O(seq) forward, online softmax, backward recompute |
 | KV-cache inference | ✅ | `Generate` uses bf16 KV-cache; prefill + decode, O(n) per token generation |
 | **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
@@ -1176,6 +1177,7 @@ in flight. 🔮 items are scoped but not yet started.
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **SwiGLU FFN.** SiLU-gated feedforward block supporting GELU and SwiGLU variants via `ConfigTransformer.FFNType`. Three-weight architecture (W_up, W_gate, W_down) matching LLaMA 2/3, Mistral, and DeepSeek. Full forward/backward with correct SiLU derivative.
 - **2026 Q2** — **Flash Attention 2.** Block-tiled O(seq) attention with online softmax (Br=Bc=64). Forward never materializes the [seq, seq] matrix; backward recomputes weights from stored Q/K/V. Combines with gradient checkpointing for ~4 KB per head peak memory. Outputs and gradients match standard attention to 1e-4.
 - **2026 Q2** — **Gradient checkpointing + fast kernels.** `ConfigTransformer.GradientCheckpointing` enables activation recompute at block boundaries — memory per block drops from O(seq² + seq×dFF) to O(seq×dModel), all block inputs stored in mmap-backed off-heap memory. Cross-entropy loss and MHA attention softmax use a pure-float32 fastexp32 approximation, eliminating the f32→f64→f32 conversion chain in the hottest loops.
 - **2026 Q2** — **Tier 1+2 production training features.** Configurable LR schedule (explicit warmup + cosine floor), AdamW weight decay, early stopping on validation loss with best-checkpoint restore, CSV metrics log for crash recovery, `ShuffledIterator` for epoch-level shuffle, `PrefetchIterator` for background batch pre-fetch, configurable gradient clipping. Updated stale "no batched matmul" comment — `matmulBatched3D` already handles batched forward/backward.
