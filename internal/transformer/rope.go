@@ -74,12 +74,46 @@ func NewRotaryEmbedding(headDim int, base float32, maxSeqLen int) *RotaryEmbeddi
 	}
 }
 
+// MaxSeqLen returns the maximum sequence length this RoPE
+// was precomputed for.
+func (r *RotaryEmbedding) MaxSeqLen() int { return r.maxSeqLen }
+
 // Cos returns the precomputed cos table. Exposed for tests
 // and for diagnostic output; not part of the Module interface.
 func (r *RotaryEmbedding) Cos() []float32 { return r.cos }
 
 // Sin returns the precomputed sin table.
 func (r *RotaryEmbedding) Sin() []float32 { return r.sin }
+
+// ExtendMaxSeqLen extends the precomputed cos/sin tables to
+// accommodate a larger max sequence length. Existing entries
+// are preserved; only the [oldMax..newMax) range is computed.
+//
+// Panics if newMax <= current maxSeqLen.
+func (r *RotaryEmbedding) ExtendMaxSeqLen(newMax int) {
+	if newMax <= r.maxSeqLen {
+		panic(fmt.Sprintf("RotaryEmbedding.ExtendMaxSeqLen: newMax=%d <= current maxSeqLen=%d", newMax, r.maxSeqLen))
+	}
+	if newMax <= 0 {
+		panic(fmt.Sprintf("RotaryEmbedding.ExtendMaxSeqLen: newMax=%d, must be > 0", newMax))
+	}
+	half := r.headDim / 2
+	newCos := alloc.Float32(newMax * half)
+	newSin := alloc.Float32(newMax * half)
+	copy(newCos, r.cos)
+	copy(newSin, r.sin)
+	for pos := r.maxSeqLen; pos < newMax; pos++ {
+		for i := 0; i < half; i++ {
+			theta := float32(1.0) / float32(math.Pow(float64(r.base), float64(2*i)/float64(r.headDim)))
+			angle := float32(float64(pos) * float64(theta))
+			newCos[pos*half+i] = float32(math.Cos(float64(angle)))
+			newSin[pos*half+i] = float32(math.Sin(float64(angle)))
+		}
+	}
+	r.cos = newCos
+	r.sin = newSin
+	r.maxSeqLen = newMax
+}
 
 // Apply rotates the last dim of x in pairs. The input is
 // the Q or K tensor from MHA, shape [batch, numHeads,
@@ -91,6 +125,8 @@ func (r *RotaryEmbedding) Sin() []float32 { return r.sin }
 // the flat row index. With [batch, numHeads, seq, headDim],
 // the position for row r is `r % seq` (the layout is
 // [b*numHeads*seq + h*seq + s] for the row index).
+//
+// Panics if any position exceeds MaxSeqLen.
 func (r *RotaryEmbedding) Apply(x *Tensor, startPos int) *Tensor {
 	if x.Rank() == 0 || x.shape[len(x.shape)-1] != r.headDim {
 		panic(fmt.Sprintf("RotaryEmbedding.Apply: last dim = %d, want %d",
@@ -112,15 +148,18 @@ func (r *RotaryEmbedding) Apply(x *Tensor, startPos int) *Tensor {
 
 	for row := 0; row < rows; row++ {
 		base := row * r.headDim
-		var posIdx int
+		var pos int
 		if startPos > 0 {
-			posIdx = startPos * half
+			pos = startPos
 		} else if x.Rank() == 1 {
-			posIdx = 0
+			pos = 0
 		} else {
-			pos := row % seqLen
-			posIdx = pos * half
+			pos = row % seqLen
 		}
+		if pos >= r.maxSeqLen {
+			panic(fmt.Sprintf("RotaryEmbedding.Apply: position %d >= maxSeqLen %d; call ExtendMaxSeqLen or increase MaxSeqLen in ConfigTransformer", pos, r.maxSeqLen))
+		}
+		posIdx := pos * half
 		cosBase := r.cos[posIdx : posIdx+half]
 		sinBase := r.sin[posIdx : posIdx+half]
 
@@ -162,15 +201,18 @@ func (r *RotaryEmbedding) BackwardApply(gradOut *Tensor, startPos int) *Tensor {
 
 	for row := 0; row < rows; row++ {
 		base := row * r.headDim
-		var posIdx int
+		var pos int
 		if startPos > 0 {
-			posIdx = startPos * half
+			pos = startPos
 		} else if gradOut.Rank() == 1 {
-			posIdx = 0
+			pos = 0
 		} else {
-			pos := row % seqLen
-			posIdx = pos * half
+			pos = row % seqLen
 		}
+		if pos >= r.maxSeqLen {
+			panic(fmt.Sprintf("RotaryEmbedding.BackwardApply: position %d >= maxSeqLen %d; call ExtendMaxSeqLen or increase MaxSeqLen in ConfigTransformer", pos, r.maxSeqLen))
+		}
+		posIdx := pos * half
 		cosBase := r.cos[posIdx : posIdx+half]
 		sinBase := r.sin[posIdx : posIdx+half]
 

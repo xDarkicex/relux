@@ -80,3 +80,67 @@ func TestRotaryEmbedding_BackwardIsInverse(t *testing.T) {
 		}
 	}
 }
+
+func TestRotaryEmbedding_OverflowPanic(t *testing.T) {
+	r := transformer.NewRotaryEmbedding(4, 10000, 4)
+	x := transformer.NewTensor([]float32{1, 2, 3, 4}, 4)
+
+	// Position 4 is at the boundary (== maxSeqLen), should panic.
+	defer func() {
+		if rec := recover(); rec == nil {
+			t.Error("Apply at position == maxSeqLen should panic")
+		}
+	}()
+	r.Apply(x, 4)
+}
+
+func TestRotaryEmbedding_ExtendMaxSeqLen(t *testing.T) {
+	r := transformer.NewRotaryEmbedding(4, 10000, 4)
+
+	// Original positions work.
+	x := transformer.NewTensor([]float32{1, 2, 3, 4}, 4)
+	y := r.Apply(x, 3)
+	if y == nil {
+		t.Fatal("Apply at pos 3 returned nil")
+	}
+
+	// Extend to 8.
+	r.ExtendMaxSeqLen(8)
+	if r.MaxSeqLen() != 8 {
+		t.Fatalf("MaxSeqLen = %d, want 8", r.MaxSeqLen())
+	}
+
+	// Old positions still work.
+	y2 := r.Apply(x, 3)
+	if y2 == nil {
+		t.Fatal("Apply at pos 3 after extend returned nil")
+	}
+	for i, v := range y2.DataF32() {
+		if math.Abs(float64(v-y.DataF32()[i])) > 1e-5 {
+			t.Errorf("after extend, pos 3 output[%d] = %v, want %v (old value)", i, v, y.DataF32()[i])
+		}
+	}
+
+	// New positions work (up to extended max).
+	y3 := r.Apply(x, 7)
+	if y3 == nil {
+		t.Fatal("Apply at pos 7 after extend returned nil")
+	}
+
+	// Extending with same or smaller value panics.
+	func() {
+		defer func() {
+			if rec := recover(); rec == nil {
+				t.Error("ExtendMaxSeqLen(4) should panic when already 8")
+			}
+		}()
+		r.ExtendMaxSeqLen(4)
+	}()
+}
+
+func TestRotaryEmbedding_MaxSeqLen(t *testing.T) {
+	r := transformer.NewRotaryEmbedding(4, 10000, 8)
+	if r.MaxSeqLen() != 8 {
+		t.Fatalf("MaxSeqLen = %d, want 8", r.MaxSeqLen())
+	}
+}

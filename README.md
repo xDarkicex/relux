@@ -370,20 +370,39 @@ func main() {
         dataset[i] = ex
     }
 
-    // Train. Adam is installed on the first Fit call.
-    t.Fit(dataset, 8 /*seqLen*/, 200 /*steps*/, 0.01 /*lr*/,
-        rand.New(rand.NewSource(42)))
+    // Train with the new FitConfig API: checkpointing,
+    // validation, and gradient accumulation.
+    _, err := t.FitIteratorConfig(
+        dataset.NewWindowedIterator(flatTokens, 8, 1, 1),
+        relux.FitConfig{
+            Steps:  200,
+            LR:     0.01,
+            RNG:    rand.New(rand.NewSource(42)),
+            // Save checkpoint every 50 optimizer steps.
+            CheckpointPath:  "toy.relux",
+            CheckpointEvery: 50,
+            // Accumulate over 4 micro-batches per optimizer step.
+            GradAccumSteps: 4,
+            OnStep: func(step int, loss, ppl float32) {
+                fmt.Printf("step %d: loss=%.4f ppl=%.2f\n", step, loss, ppl)
+            },
+        },
+    )
+    if err != nil {
+        panic(err)
+    }
 
     // Generate from a prompt.
     out, _ := t.Generate([]int{1, 2, 3}, 8 /*maxNew*/, 0.8 /*temp*/, 3 /*topK*/)
     fmt.Printf("generated: %v\n", out)
 
-    // Persist in the v1 binary format.
-    t.SaveFile("toy.relux")
-
-    // Load and resume.
-    loaded, _, _ := relux.LoadTransformerFile("toy.relux")
-    _ = loaded
+    // Load checkpoint and resume training.
+    loaded, state, _ := relux.LoadTransformerFile("toy_step_100.relux")
+    loaded.SetOptimizerState(state) // restore Adam m/v
+    loaded.FitIteratorConfig(
+        dataset.NewWindowedIterator(flatTokens, 8, 1, 1),
+        relux.FitConfig{Steps: 100, LR: 0.005},
+    )
 }
 ```
 
@@ -425,7 +444,6 @@ func main() {
     files, _ := filepath.Glob("corpus/*.go")
 
     // Option A: In-memory (small datasets).
-    // Tokenize everything, pack into windows, train.
     var allTokens []int
     for _, f := range files {
         data, _ := os.ReadFile(f)
@@ -437,11 +455,34 @@ func main() {
     it := dataset.NewWindowedIterator(allTokens, 1024, 1, 1)
     t.FitIterator(it, 5000, 3e-4, nil)
 
-    // Option B: Streaming from text files (medium datasets).
+    // Option B: Full production training with FitIteratorConfig.
+    // Checkpointing, validation, and gradient accumulation.
+    trainIter := dataset.NewWindowedIterator(allTokens, 1024, 1, 1)
+    valIter := dataset.NewWindowedIterator(valTokens, 1024, 1, 1)
+    t.FitIteratorConfig(trainIter, relux.FitConfig{
+        Steps:           5000,
+        LR:              3e-4,
+        GradAccumSteps:  8,               // effective batch = 8
+        CheckpointPath:  "ckpt.relux",
+        CheckpointEvery: 500,             // save every 500 steps
+        ValIterator:     valIter,
+        ValEvery:        250,             // validate every 250 steps
+        OnStep: func(step int, loss, ppl float32) {
+            fmt.Printf("step %d: loss=%.4f ppl=%.2f\n", step, loss, ppl)
+        },
+        OnVal: func(step int, valLoss, valPPL float32) {
+            fmt.Printf("val@%d: val_loss=%.4f val_ppl=%.2f\n", step, valLoss, valPPL)
+        },
+        OnEpoch: func(epoch int, avgLoss, avgPPL float32) {
+            fmt.Printf("epoch %d complete: avg_loss=%.4f avg_ppl=%.2f\n", epoch, avgLoss, avgPPL)
+        },
+    })
+
+    // Option C: Streaming from text files (medium datasets).
     it2 := dataset.NewTextFileIterator(files, tok, 1024, 1)
     t.FitIterator(it2, 5000, 3e-4, rand.New(rand.NewSource(42)))
 
-    // Option C: Pre-tokenized binary (large datasets — tokenize once).
+    // Option D: Pre-tokenized binary (large datasets — tokenize once).
     dataset.PreprocessWithSeparators(files, tok, "corpus.bin")
     it3, _ := dataset.NewMmapIterator("corpus.bin", 1024, 1)
     t.FitIterator(it3, 10000, 3e-4, nil)
@@ -481,17 +522,28 @@ func main() {
 ### **Training pipeline**
 - 📥 **Data ingestion**: `tokenizer/` loads any `tokenizer.json`;
   `dataset/` provides three streaming iterators (in-memory windows,
-  text-file streaming, pre-tokenized binary mmap)
+  text-file streaming, pre-tokenized binary mmap) plus two wrappers
+  (`ShuffledIterator` for epoch-level shuffle, `PrefetchIterator` for
+  background pre-fetch)
 - 🔄 **Streaming training**: `Transformer.FitIterator` accepts an
-  `Iterator` and trains multi-epoch with auto-reset
-- 🚀 **Adaptive optimization**: Adam (default for transformer), SGD
-  with momentum (default for MLP), learning rate scheduling
-- 📊 **Training monitoring**: real-time loss, convergence detection
-- 🛑 **Automated controls**: early stopping, gradient clipping,
-  mini-batch with shuffle
+  `Iterator` and trains multi-epoch with auto-reset.
+  `Transformer.FitIteratorConfig` adds full production support:
+  periodic checkpointing, held-out validation, gradient accumulation,
+  configurable warmup+cosine LR schedule, AdamW weight decay, early
+  stopping on val loss, metrics CSV logging, and epoch callbacks.
+- 🚀 **Adaptive optimization**: Adam (default for transformer) with
+  weight decay (AdamW), SGD with momentum (default for MLP),
+  configurable warmup + cosine decay LR schedule
+- 📊 **Training monitoring**: per-step and per-epoch callbacks,
+  validation perplexity on held-out data, real-time loss tracking,
+  CSV metrics log for crash recovery
+- 🛑 **Automated controls**: gradient clipping (configurable),
+  gradient accumulation (simulate large effective batch sizes),
+  early stopping on validation loss with best-checkpoint restore
 - 💾 **Persistence**: v0 (gob) for Network, v1 (binary with
   CRC32 + SHA-256 checksums) for Transformer. Both round-trip
-  optimizer state.
+  optimizer state. Mid-training checkpointing with optimizer
+  state resume.
 
 ### **Deployment**
 - 🏢 **Zero runtime dependencies** — pure Go with optional rnxa
@@ -1067,6 +1119,15 @@ in flight. 🔮 items are scoped but not yet started.
 | Streaming dataset pipeline | ✅ | `dataset/` — `Iterator` interface + 3 impls: `WindowedIterator`, `TextFileIterator`, `MmapIterator` |
 | Corpus pre-tokenization | ✅ | `dataset.Preprocess`, `PreprocessWithSeparators` → int32 binary files |
 | Transformer streaming training | ✅ | `Transformer.FitIterator(iter Iterator, ...)` — auto-reset multi-epoch |
+| **FitIteratorConfig** — production training | ✅ | Checkpointing, validation, gradient accumulation, epoch callbacks |
+| **Adam state resume** | ✅ | `SetOptimizerState` auto-creates Adam on loaded models; mid-training checkpoint state preserved |
+| **RoPE overflow guard** | ✅ | Bounds check with clear panic; `ExtendMaxSeqLen` for dynamic extension |
+| **Configurable LR schedule** | ✅ | `FitConfig.WarmupSteps`, `MinLRRatio` — explicit warmup + cosine floor |
+| **Weight decay (AdamW)** | ✅ | Decoupled weight decay in Adam; `FitConfig.WeightDecay` |
+| **Early stopping on val loss** | ✅ | `FitConfig.EarlyStoppingPatience` — best snapshot saved/restored |
+| **Training metrics log** | ✅ | `FitConfig.MetricsLogPath` — CSV with step, train_loss, val_loss, ppl, lr |
+| **ShuffledIterator** | ✅ | `dataset.NewShuffledIterator` — epoch-level batch shuffle |
+| **PrefetchIterator** | ✅ | `dataset.NewPrefetchIterator` — background goroutine pre-fetches batches |
 | KV-cache inference | ✅ | `Generate` uses bf16 KV-cache; prefill + decode, O(n) per token generation |
 | **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
 | v0 .relux (gob) back compat | ✅ | `Network.Load` sniffs magic; dispatches v0/v1 |
@@ -1111,6 +1172,8 @@ in flight. 🔮 items are scoped but not yet started.
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **Tier 1+2 production training features.** Configurable LR schedule (explicit warmup + cosine floor), AdamW weight decay, early stopping on validation loss with best-checkpoint restore, CSV metrics log for crash recovery, `ShuffledIterator` for epoch-level shuffle, `PrefetchIterator` for background batch pre-fetch, configurable gradient clipping. Updated stale "no batched matmul" comment — `matmulBatched3D` already handles batched forward/backward.
+- **2026 Q2** — **Production training support.** `FitIteratorConfig` adds periodic checkpointing, held-out validation with perplexity, gradient accumulation for large effective batch sizes, and per-epoch callbacks. Adam state resume works end-to-end: `SetOptimizerState` auto-creates Adam on freshly-loaded transformers, and mid-training checkpoints capture live optimizer state. RoPE overflow guard with `ExtendMaxSeqLen` prevents silent panics on long generations.
 - **2026 Q2** — **KV-cache wired into Generate.** Prefill caches K/V (bf16, pre-GQA-expand) for the full prompt; subsequent decode steps process one token at a time attending over the full cached sequence. Causal mask is correct for both phases. O(n²) total vs O(n³) without cache.
 - **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. Per-token CE gradient naturally focuses the gradient on the target position; log-sum-exp trick preserves numerical stability for large vocabularies.
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added

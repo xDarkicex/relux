@@ -285,3 +285,67 @@ func TestTextFileIterator_EmptyFile(t *testing.T) {
 		t.Errorf("expected EOF for empty file, got %v", err)
 	}
 }
+
+func TestShuffledIterator_SameCount(t *testing.T) {
+	tokens := make([]int, 200)
+	for i := range tokens {
+		tokens[i] = i % 10
+	}
+	inner := NewWindowedIterator(tokens, 8, 2, 1)
+	si := NewShuffledIterator(inner, nil)
+
+	// Count batches across two epochs (should be same).
+	var count1, count2 int
+	for {
+		_, err := si.Next()
+		if isEOF(err) {
+			break
+		}
+		count1++
+	}
+	si.Reset()
+	for {
+		_, err := si.Next()
+		if isEOF(err) {
+			break
+		}
+		count2++
+	}
+	if count1 != count2 {
+		t.Errorf("count1=%d, count2=%d after reset", count1, count2)
+	}
+	if count1 == 0 {
+		t.Error("expected > 0 batches")
+	}
+}
+
+func TestPrefetchIterator_BatchesMatch(t *testing.T) {
+	tokens := make([]int, 200)
+	for i := range tokens {
+		tokens[i] = i % 10
+	}
+	inner := NewWindowedIterator(tokens, 8, 2, 1)
+	pi := NewPrefetchIterator(inner, 4)
+
+	var batches []Batch
+	for {
+		b, err := pi.Next()
+		if isEOF(err) {
+			break
+		}
+		batches = append(batches, b)
+	}
+	if len(batches) == 0 {
+		t.Error("expected > 0 batches from prefetch")
+	}
+
+	// Reset and verify we get batches again.
+	pi.Reset()
+	b, err := pi.Next()
+	if err != nil {
+		t.Fatalf("Next after reset: %v", err)
+	}
+	if len(b.Input) == 0 {
+		t.Error("empty batch after prefetch reset")
+	}
+}

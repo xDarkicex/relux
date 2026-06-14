@@ -51,10 +51,11 @@ import (
 // precision needed for the variance estimate. Storing in float64 wastes
 // memory and the math is well-conditioned for float32.
 type Adam struct {
-	LR    float32
-	Beta1 float32
-	Beta2 float32
-	Eps   float32
+	LR          float32
+	Beta1       float32
+	Beta2       float32
+	Eps         float32
+	WeightDecay float32 // decoupled weight decay (AdamW); 0 = none
 
 	// t is the timestep, incremented on each Step call.
 	t int
@@ -130,6 +131,18 @@ func (a *Adam) Step(params []Param) error {
 			p.Data[i] = bf16AddFloat32(bf16ToFloat32(p.Data[i]), -step)
 		}
 	}
+
+	// Decoupled weight decay (AdamW).
+	if a.WeightDecay > 0 {
+		decay := a.LR * a.WeightDecay
+		for _, p := range params {
+			for i := range p.Data {
+				w := bf16ToFloat32(p.Data[i])
+				p.Data[i] = float32ToBF16(w - decay*w)
+			}
+		}
+	}
+
 	return nil
 }
 

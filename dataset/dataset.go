@@ -139,6 +139,8 @@ func packWindows(flat []int, seqLen int) Batch {
 var _ Iterator = (*WindowedIterator)(nil)
 var _ Iterator = (*TextFileIterator)(nil)
 var _ Iterator = (*MmapIterator)(nil)
+var _ Iterator = (*ShuffledIterator)(nil)
+var _ Iterator = (*PrefetchIterator)(nil)
 
 // ensureEOF wraps io.EOF so it can be compared with ==.
 func isEOF(err error) bool { return err == io.EOF }

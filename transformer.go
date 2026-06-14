@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"os"
 
 	"github.com/xDarkicex/relux/dataset"
 	"github.com/xDarkicex/relux/internal/compute"
@@ -86,6 +87,52 @@ type ConfigTransformer struct {
 	RopeBase   float32
 	NormEps    float32
 	Causal     bool
+}
+
+// FitConfig configures a training run via FitIteratorConfig.
+type FitConfig struct {
+	Steps int
+	LR    float32
+	RNG   *rand.Rand
+
+	// Gradient accumulation: accumulate over K micro-batches
+	// before one Adam step. 1 (default) = no accumulation.
+	GradAccumSteps int
+
+	// LR schedule. WarmupSteps sets the exact number of warmup
+	// steps. 0 means auto: 10% of Steps if Steps >= 1000,
+	// otherwise no warmup. MinLRRatio sets the cosine decay
+	// floor as a fraction of peak LR (0 = default: 0.1).
+	WarmupSteps int
+	MinLRRatio  float32
+
+	// Weight decay (AdamW, decoupled). 0 = none.
+	WeightDecay float32
+
+	// Early stopping based on validation loss. Stop after N
+	// consecutive val checks without improvement. 0 = never.
+	// Requires ValIterator and ValEvery to be set.
+	EarlyStoppingPatience int
+
+	// MetricsLogPath writes CSV training metrics to this file.
+	// Empty string = no log.
+	MetricsLogPath string
+
+	// Gradient clipping max norm. 0 = default: 1.0.
+	GradClipNorm float32
+
+	// Checkpointing.
+	CheckpointPath  string // base path, e.g. "ckpt.relv"
+	CheckpointEvery int    // save every N optimizer steps (0 = never)
+
+	// Validation.
+	ValIterator dataset.Iterator
+	ValEvery    int // validate every N optimizer steps (0 = never)
+
+	// Callbacks.
+	OnStep  func(step int, loss float32, ppl float32)
+	OnEpoch func(epoch int, avgLoss float32, avgPPL float32)
+	OnVal   func(step int, valLoss float32, valPPL float32)
 }
 
 // NewTransformer constructs a Transformer from a config. The
@@ -276,6 +323,33 @@ func (t *Transformer) TrainStep(input, target []int, batchSize int) (float32, er
 	return loss, nil
 }
 
+// EvalStep runs a forward pass and computes the cross-entropy
+// loss without modifying gradients. Used for validation.
+func (t *Transformer) EvalStep(input, target []int, batchSize int) float32 {
+	t.setMode(transformer.Inference)
+	logits := t.Forward(input, batchSize)
+	logitsData, _ := logits.ToF32()
+	vocab := t.config.VocabSize
+	totalTokens := batchSize * (len(input) / batchSize)
+	var loss float32
+	for i := 0; i < totalTokens; i++ {
+		tgt := target[i]
+		base := i * vocab
+		maxVal := logitsData[base]
+		for j := 1; j < vocab; j++ {
+			if logitsData[base+j] > maxVal {
+				maxVal = logitsData[base+j]
+			}
+		}
+		var sumExp float32
+		for j := 0; j < vocab; j++ {
+			sumExp += float32(math.Exp(float64(logitsData[base+j] - maxVal)))
+		}
+		loss += -float32(math.Log(float64(float32(math.Exp(float64(logitsData[base+tgt]-maxVal))) / sumExp)))
+	}
+	return loss
+}
+
 // Fit runs a small training loop for `steps` iterations
 // on the given dataset. Each step picks a random
 // sequence from dataset, runs TrainStep, accumulates
@@ -367,86 +441,304 @@ func (t *Transformer) Fit(dataset [][]int, seqLen int, steps int, lr float32, rn
 //   - warmup (first 10% of steps): linear ramp 0 → lr
 //   - cosine decay (remaining 90%): lr → 0.1×lr
 //
-// Batches are processed one sequence at a time through TrainStep
-// (no batched matmul). Batched forward/backward is deferred to a
-// dedicated follow-up project.
+// Forward/backward is batched via matmulBatched3D (3D tensors).
+// The loss computation (softmax + cross-entropy) runs as a per-token
+// CPU loop and is the primary remaining bottleneck at small model sizes.
 //
 // If onStep is non-nil it is called after every optimizer step
 // with (step, loss, perplexity).
 func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, rng *rand.Rand, onStep func(step int, loss float32, ppl float32)) (float32, error) {
-	if steps <= 0 {
-		return 0, errors.New("relux.Transformer.FitIterator: steps must be > 0")
+	return t.FitIteratorConfig(iter, FitConfig{
+		Steps:  steps,
+		LR:     lr,
+		RNG:    rng,
+		OnStep: onStep,
+	})
+}
+
+// FitIteratorConfig trains the transformer using a streaming
+// dataset iterator with full training-run support: gradient
+// accumulation, periodic checkpointing, held-out validation,
+// and epoch tracking.
+func (t *Transformer) FitIteratorConfig(iter dataset.Iterator, cfg FitConfig) (float32, error) {
+	if cfg.Steps <= 0 {
+		return 0, errors.New("relux.Transformer.FitIteratorConfig: cfg.Steps must be > 0")
 	}
-	if rng == nil {
-		rng = rand.New(rand.NewSource(1))
+	if cfg.RNG == nil {
+		cfg.RNG = rand.New(rand.NewSource(1))
 	}
-	peakLR := lr
+	gradAccum := cfg.GradAccumSteps
+	if gradAccum <= 0 {
+		gradAccum = 1
+	}
+	checkpointEvery := cfg.CheckpointEvery
+	valEvery := cfg.ValEvery
+
+	peakLR := cfg.LR
 	if t.adam == nil {
 		t.adam = &optim.Adam{
-			LR:    peakLR,
-			Beta1: 0.9,
-			Beta2: 0.999,
-			Eps:   1e-8,
+			LR:          peakLR,
+			Beta1:       0.9,
+			Beta2:       0.999,
+			Eps:         1e-8,
+			WeightDecay: cfg.WeightDecay,
 		}
 	}
-	// Warmup: 10% of total steps. For runs shorter than
-	// 1000 steps the warmup ramp would consume too much
-	// of the training budget relative to the tiny model
-	// size, so we use constant LR.
-	warmupSteps := 0
-	if steps >= 1000 {
-		warmupSteps = steps / 10
+	t.adam.WeightDecay = cfg.WeightDecay
+	// Resume from checkpoint: if optimState was set via
+	// SetOptimizerState, load it into Adam now.
+	if t.optimState != nil && t.adam != nil {
+		t.adam.LoadState(*t.optimState)
+		t.optimState = nil
 	}
-	var totalLoss float32
-	validSteps := 0
-	for step := 0; step < steps; step++ {
-		// LR schedule.
-		if warmupSteps > 0 && step < warmupSteps {
-			// Linear warmup: 0 → peakLR.
-			t.adam.LR = peakLR * float32(step+1) / float32(warmupSteps)
-		} else if warmupSteps > 0 {
-			// Cosine decay: peakLR → 0.1×peakLR.
-			progress := float32(step-warmupSteps) / float32(steps-warmupSteps)
-			t.adam.LR = peakLR * (0.1 + 0.45*(1.0+float32(math.Cos(float64(math.Pi*progress)))))
+
+	// Warmup schedule.
+	warmupSteps := cfg.WarmupSteps
+	if warmupSteps == 0 && cfg.Steps >= 1000 {
+		warmupSteps = cfg.Steps / 10
+	}
+	minLRRatio := cfg.MinLRRatio
+	if minLRRatio <= 0 {
+		minLRRatio = 0.1
+	}
+	gradClipNorm := cfg.GradClipNorm
+	if gradClipNorm <= 0 {
+		gradClipNorm = 1.0
+	}
+	var (
+		totalLoss    float32
+		epochLoss    float32
+		epochSteps   int
+		epoch        int
+		validSteps   int
+		microLoss    float32
+		microCount   int
+	)
+
+	// Metrics log.
+	var (
+		metricsFile *os.File
+		lastValLoss float32 = -1
+	)
+	if cfg.MetricsLogPath != "" {
+		f, err := os.Create(cfg.MetricsLogPath)
+		if err != nil {
+			return 0, fmt.Errorf("metrics log: %w", err)
 		}
-		batch, err := iter.Next()
-		if err == io.EOF {
-			iter.Reset()
-			batch, err = iter.Next()
+		metricsFile = f
+		defer f.Close()
+		fmt.Fprintf(f, "step,train_loss,train_ppl,val_loss,val_ppl,lr\n")
+	}
+
+	// Early stopping state.
+	var (
+		bestValLoss    float32 = float32(math.Inf(1))
+		noImproveCount int
+		bestCkptPath   string
+	)
+	if cfg.EarlyStoppingPatience > 0 && cfg.CheckpointPath != "" {
+		bestCkptPath = cfg.CheckpointPath + ".best.relv"
+	}
+
+	// checkpointPath inserts the step number before the extension.
+	checkpointPath := func(base string, step int) string {
+		for i := len(base) - 1; i >= 0; i-- {
+			if base[i] == '.' {
+				return base[:i] + fmt.Sprintf("_step_%d", step) + base[i:]
+			}
+		}
+		return base + fmt.Sprintf("_step_%d", step)
+	}
+
+	// doVal runs a forward-only pass over the validation iterator.
+	doVal := func(step int) {
+		if cfg.ValIterator == nil {
+			return
+		}
+		var valLoss float32
+		var valTokens int
+		cfg.ValIterator.Reset()
+		for {
+			batch, err := cfg.ValIterator.Next()
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
+				break
+			}
+			bSize := len(batch.Input)
+			if bSize == 0 {
 				continue
 			}
-		} else if err != nil {
-			return totalLoss / float32(max(validSteps, 1)), err
+			seqLen := len(batch.Input[0])
+			flatInput := make([]int, bSize*seqLen)
+			flatTarget := make([]int, bSize*seqLen)
+			for bi := 0; bi < bSize; bi++ {
+				copy(flatInput[bi*seqLen:], batch.Input[bi])
+				copy(flatTarget[bi*seqLen:], batch.Target[bi])
+			}
+			valLoss += t.EvalStep(flatInput, flatTarget, bSize)
+			valTokens += bSize * seqLen
 		}
-		// Flatten batch into single call.
-		bSize := len(batch.Input)
-		seqLen := len(batch.Input[0])
-		flatInput := make([]int, bSize*seqLen)
-		flatTarget := make([]int, bSize*seqLen)
-		for bi := 0; bi < bSize; bi++ {
-			copy(flatInput[bi*seqLen:], batch.Input[bi])
-			copy(flatTarget[bi*seqLen:], batch.Target[bi])
-		}
-		// Zero gradients.
-		for _, p := range t.Params() {
-			for j := range p.Grad {
-				p.Grad[j] = 0
+		if valTokens > 0 {
+			valPPL := float32(math.Exp(float64(valLoss / float32(valTokens))))
+			lastValLoss = valLoss / float32(valTokens)
+			if cfg.OnVal != nil {
+				cfg.OnVal(step, valLoss, valPPL)
 			}
 		}
-		loss, err := t.TrainStep(flatInput, flatTarget, bSize)
-		if err != nil {
-			return totalLoss / float32(max(validSteps, 1)), err
+	}
+
+	getBatch := func() (dataset.Batch, error) {
+		batch, err := iter.Next()
+		if err == io.EOF {
+			if epochSteps > 0 && cfg.OnEpoch != nil {
+				avgLoss := float32(0.0)
+				if epochSteps > 0 {
+					avgLoss = epochLoss / float32(epochSteps)
+				}
+				avgPPL := float32(0.0)
+				if avgLoss > 0 {
+					avgPPL = float32(math.Exp(float64(avgLoss)))
+				}
+				cfg.OnEpoch(epoch, avgLoss, avgPPL)
+			}
+			epochLoss = 0
+			epochSteps = 0
+			epoch++
+			iter.Reset()
+			batch, err = iter.Next()
 		}
-		optim.ClipGradNorm(t.Params(), 1.0)
+		return batch, err
+	}
+
+	// The training loop is structured as: for each optimizer step,
+	// accumulate over gradAccum micro-batches.
+	scaledGradNorm := gradClipNorm / float32(gradAccum)
+	for step := 0; step < cfg.Steps; step++ {
+		// LR schedule (per optimizer step).
+		if warmupSteps > 0 && step < warmupSteps {
+			t.adam.LR = peakLR * float32(step+1) / float32(warmupSteps)
+		} else if warmupSteps > 0 {
+			progress := float32(step-warmupSteps) / float32(cfg.Steps-warmupSteps)
+			t.adam.LR = peakLR * (minLRRatio + (1.0-minLRRatio)*0.5*(1.0+float32(math.Cos(float64(math.Pi*progress)))))
+		}
+
+		microLoss = 0
+		microCount = 0
+		microTokens := 0
+
+		for acc := 0; acc < gradAccum; acc++ {
+			batch, err := getBatch()
+			if err != nil {
+				return totalLoss / float32(max(validSteps, 1)), err
+			}
+			bSize := len(batch.Input)
+			if bSize == 0 {
+				continue
+			}
+			seqLen := len(batch.Input[0])
+			flatInput := make([]int, bSize*seqLen)
+			flatTarget := make([]int, bSize*seqLen)
+			for bi := 0; bi < bSize; bi++ {
+				copy(flatInput[bi*seqLen:], batch.Input[bi])
+				copy(flatTarget[bi*seqLen:], batch.Target[bi])
+			}
+
+			// Zero gradients only at the start of an accumulation group.
+			if acc == 0 {
+				for _, p := range t.Params() {
+					for j := range p.Grad {
+						p.Grad[j] = 0
+					}
+				}
+			}
+
+			loss, err := t.TrainStep(flatInput, flatTarget, bSize)
+			if err != nil {
+				return totalLoss / float32(max(validSteps, 1)), err
+			}
+			microLoss += loss
+			microCount++
+			microTokens += bSize * seqLen
+		}
+
+		if microCount == 0 {
+			continue
+		}
+
+		// Gradient clipping with accumulation scaling.
+		optim.ClipGradNorm(t.Params(), scaledGradNorm)
 		t.adam.Step(t.Params())
-		totalLoss += loss
+
+		totalLoss += microLoss
+		epochLoss += microLoss
+		epochSteps += microCount
 		validSteps++
-		if onStep != nil {
-			ppl := float32(math.Exp(float64(loss / float32(bSize*seqLen))))
-			onStep(validSteps, loss, ppl)
+
+		// Checkpointing.
+		if checkpointEvery > 0 && validSteps%checkpointEvery == 0 && cfg.CheckpointPath != "" {
+			path := checkpointPath(cfg.CheckpointPath, validSteps)
+			if err := t.SaveFile(path); err != nil {
+				return totalLoss / float32(max(validSteps, 1)), fmt.Errorf("checkpoint save at step %d: %w", validSteps, err)
+			}
+		}
+
+		// Validation.
+		if valEvery > 0 && validSteps%valEvery == 0 {
+			doVal(validSteps)
+		}
+
+		// Early stopping: track best val loss from the most recent val check.
+		if cfg.EarlyStoppingPatience > 0 && valEvery > 0 && validSteps%valEvery == 0 {
+			curValLoss := lastValLoss
+			if curValLoss >= 0 && curValLoss < bestValLoss {
+				bestValLoss = curValLoss
+				noImproveCount = 0
+				// Save best snapshot.
+				if bestCkptPath != "" {
+					if err := t.SaveFile(bestCkptPath); err != nil {
+						return totalLoss / float32(max(validSteps, 1)), fmt.Errorf("best checkpoint save: %w", err)
+					}
+				}
+			} else if curValLoss >= 0 {
+				noImproveCount++
+				if noImproveCount >= cfg.EarlyStoppingPatience {
+					// Restore best snapshot.
+					if bestCkptPath != "" {
+						loaded, _, loadErr := LoadTransformerFile(bestCkptPath)
+						if loadErr != nil {
+							return totalLoss / float32(max(validSteps, 1)), fmt.Errorf("restore best checkpoint: %w", loadErr)
+						}
+						// Copy weights into current transformer.
+						copyWeights(t, loaded)
+					}
+					break
+				}
+			}
+		}
+
+		// onStep callback.
+		if cfg.OnStep != nil {
+			ppl := float32(math.Exp(float64(microLoss / float32(microTokens))))
+			cfg.OnStep(validSteps, microLoss, ppl)
+		}
+
+		// Metrics log.
+		if metricsFile != nil {
+			ppl := float32(math.Exp(float64(microLoss / float32(microTokens))))
+			fmt.Fprintf(metricsFile, "%d,%f,%f,%f,%f,%f\n",
+				validSteps, microLoss, ppl, lastValLoss, float32(math.Exp(float64(lastValLoss))), t.adam.LR)
 		}
 	}
+
+	// Final epoch callback if we trained at all.
+	if epochSteps > 0 && cfg.OnEpoch != nil {
+		avgLoss := epochLoss / float32(epochSteps)
+		avgPPL := float32(math.Exp(float64(avgLoss)))
+		cfg.OnEpoch(epoch, avgLoss, avgPPL)
+	}
+
 	t.optimState = stateFromAdam(t.adam)
 	return totalLoss / float32(max(validSteps, 1)), nil
 }
@@ -530,6 +822,15 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 // serialization / debug.
 func (t *Transformer) Config() ConfigTransformer { return t.config }
 
+// AdamLR returns the current Adam learning rate. Returns 0 if
+// no Adam is installed. Exposed for tests and diagnostics.
+func (t *Transformer) AdamLR() float32 {
+	if t.adam == nil {
+		return 0
+	}
+	return t.adam.LR
+}
+
 // SetBackend replaces the compute backend. Set to nil to use
 // pure Go (the default). The global transformer.Backend is
 // also updated so the internal matmulBatched3D helper picks
@@ -574,4 +875,13 @@ func (t *Transformer) Summary() string {
 	return fmt.Sprintf("Transformer(vocab=%d, dModel=%d, heads=%d, kvHeads=%d, layers=%d, dFF=%d, maxSeqLen=%d)",
 		t.config.VocabSize, t.config.DModel, t.config.NumHeads, t.config.NumKVHeads,
 		t.config.NumLayers, t.config.DFF, t.config.MaxSeqLen)
+}
+
+// copyWeights copies all parameter data from src to dst.
+func copyWeights(dst, src *Transformer) {
+	dstParams := dst.Params()
+	srcParams := src.Params()
+	for i := range dstParams {
+		copy(dstParams[i].Data, srcParams[i].Data)
+	}
 }

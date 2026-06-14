@@ -542,21 +542,32 @@ func LoadTransformerFile(path string) (*Transformer, *optim.State, error) {
 // transformer's owned Adam. Use this after LoadTransformer
 // to resume training with the saved state.
 func (t *Transformer) SetOptimizerState(state *optim.State) error {
-	if t.adam == nil {
-		return errors.New("Transformer.SetOptimizerState: no Adam installed; Transformer.Fit must be called at least once to install an optimizer")
-	}
 	if state == nil {
 		return nil
 	}
+	if t.adam == nil {
+		t.adam = &optim.Adam{
+			LR:    0,
+			Beta1: 0.9,
+			Beta2: 0.999,
+			Eps:   1e-8,
+		}
+	}
+	t.optimState = state
 	return t.adam.LoadState(*state)
 }
 
 // getOptimizerState returns the current optim.State of the
-// transformer's Adam. Returns nil if Fit has never been
-// called.
+// transformer's Adam. Returns the cached state if available,
+// otherwise captures the live Adam state. Returns nil only
+// if no Adam has ever been installed.
 func (t *Transformer) getOptimizerState() *optim.State {
 	if t.adam == nil {
 		return nil
 	}
-	return t.optimState
+	if t.optimState != nil {
+		return t.optimState
+	}
+	st := t.adam.State()
+	return &st
 }
