@@ -133,23 +133,19 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTransformer: %v", err)
 	}
-	// Synthesize a structured dataset: 20 sequences of
-	// length 9, each starting at a random token and
-	// incrementing by 1 mod vocab for the next 8 tokens.
-	// This is learnable: the model can pick up the
-	// "+1 mod 20" pattern.
-	dataset := make([][]int, 20)
-	for i := range dataset {
+	// Train the model on structured increment sequences.
+	ds := make([][]int, 20)
+	for i := range ds {
 		ex := make([]int, 9)
 		ex[0] = i % cfg.VocabSize
 		for j := 1; j < 9; j++ {
 			ex[j] = (ex[j-1] + 1) % cfg.VocabSize
 		}
-		dataset[i] = ex
+		ds[i] = ex
 	}
 
 	// Single TrainStep to capture initial loss.
-	ex := dataset[0]
+	ex := ds[0]
 	initialLoss, err := tr.TrainStep(ex[:len(ex)-1], ex[1:])
 	if err != nil {
 		t.Fatalf("initial TrainStep: %v", err)
@@ -157,7 +153,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 
 	// Train. The full backward chain is now wired, so the
 	// blocks' params get updated, not just the lmHead.
-	_, err = tr.Fit(dataset, 8, 800, 0.01, nil)
+	_, err = tr.Fit(ds, 8, 2000, 0.005, rand.New(rand.NewSource(42)))
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}

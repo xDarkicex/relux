@@ -50,6 +50,7 @@ var (
 type slotInfo struct {
 	fl       *memory.ShardedFreeList
 	slotSize uint64
+	off      uintptr // offset from slot start to user data
 }
 
 // bucketFor rounds size up to the next power of two, with a floor of
@@ -92,14 +93,17 @@ func Float32(n int) []float32 {
 	if n <= 0 {
 		return nil
 	}
-	bytes := uint64(n) * 4
-	slotSize := bucketFor(bytes)
+	// Size the slot to hold both the Hyaline metadata header and
+	// the user data so clear() does not corrupt freelist internals.
+	dataBytes := uint64(n) * 4
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
 	fl := getFreelist(slotSize)
 	if fl != nil {
 		if buf, err := fl.Allocate(); err == nil {
-			addr := uintptr(unsafe.Pointer(&buf[0]))
-			slotOwner.Store(addr, slotInfo{fl: fl, slotSize: slotSize})
-			s := unsafe.Slice((*float32)(unsafe.Pointer(&buf[0])), n)
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*float32)(userPtr), n)
 			clear(s)
 			return s
 		}
@@ -117,15 +121,16 @@ func Float64(n int) []float64 {
 	if n <= 0 {
 		return nil
 	}
-	bytes := uint64(n) * 8
-	slotSize := bucketFor(bytes)
+	dataBytes := uint64(n) * 8
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
 	fl := getFreelist(slotSize)
 	if fl != nil {
 		if buf, err := fl.Allocate(); err == nil {
-			addr := uintptr(unsafe.Pointer(&buf[0]))
-			slotOwner.Store(addr, slotInfo{fl: fl, slotSize: slotSize})
-			s := unsafe.Slice((*float64)(unsafe.Pointer(&buf[0])), n)
-			clear(s) // zero-init the visible portion of the slot
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*float64)(userPtr), n)
+			clear(s)
 			return s
 		}
 	}
@@ -138,14 +143,16 @@ func ByteSlice(n int) []byte {
 	if n <= 0 {
 		return nil
 	}
-	slotSize := bucketFor(uint64(n))
+	slotSize := bucketFor(uint64(minSlotSize) + uint64(n))
 	fl := getFreelist(slotSize)
 	if fl != nil {
 		if buf, err := fl.Allocate(); err == nil {
-			addr := uintptr(unsafe.Pointer(&buf[0]))
-			slotOwner.Store(addr, slotInfo{fl: fl, slotSize: slotSize})
-			clear(buf)
-			return buf
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*byte)(userPtr), n)
+			clear(s)
+			return s
 		}
 	}
 	return make([]byte, n)
@@ -159,13 +166,15 @@ func Uint16(n int) []uint16 {
 	if n <= 0 {
 		return nil
 	}
-	slotSize := bucketFor(uint64(n) * 2)
+	dataBytes := uint64(n) * 2
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
 	fl := getFreelist(slotSize)
 	if fl != nil {
 		if buf, err := fl.Allocate(); err == nil {
-			addr := uintptr(unsafe.Pointer(&buf[0]))
-			slotOwner.Store(addr, slotInfo{fl: fl, slotSize: slotSize})
-			s := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[0])), n)
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*uint16)(userPtr), n)
 			clear(s)
 			return s
 		}
@@ -190,7 +199,10 @@ func Free[T any](s []T) {
 		return
 	}
 	info := v.(slotInfo)
-	slot := unsafe.Slice((*byte)(unsafe.Pointer(addr)), info.slotSize)
+	// Reconstruct the full slot (including the Hyaline header that
+	// precedes the user data) so Deallocate sees the intact metadata.
+	slotStart := unsafe.Pointer(addr - info.off)
+	slot := unsafe.Slice((*byte)(slotStart), int(info.slotSize))
 	_ = info.fl.Deallocate(slot)
 }
 
