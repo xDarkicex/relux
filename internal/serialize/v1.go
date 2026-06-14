@@ -67,6 +67,7 @@ const (
 	LayerTagMLP       uint8 = 4
 	LayerTagRoPE      uint8 = 5
 	LayerTagLinear    uint8 = 6
+	LayerTagMLA       uint8 = 7
 )
 
 // AdamState is the per-param Adam state we serialize in

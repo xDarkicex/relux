@@ -12,25 +12,35 @@ import (
 // Sampler produces token IDs from a logits vector. The
 // standard triad is:
 //
-//   Greedy:      argmax(logits)
-//   Temperature: divide logits by T before softmax; T->0
-//                approaches greedy, T->1 is the unmodified
-//                distribution, T>1 flattens (more random)
-//   Top-k:       keep the top K logits, mask the rest to
-//                -inf before softmax
-//   Top-p:       nucleus sampling — sort descending, keep
-//                the smallest prefix whose cumulative prob
-//                is >= p, mask the rest
+//	Greedy:      argmax(logits)
+//	Temperature: divide logits by T before softmax; T->0
+//	             approaches greedy, T->1 is the unmodified
+//	             distribution, T>1 flattens (more random)
+//	Top-k:       keep the top K logits, mask the rest to
+//	             -inf before softmax
+//	Top-p:       nucleus sampling — sort descending, keep
+//	             the smallest prefix whose cumulative prob
+//	             is >= p, mask the rest
+//	Min-p:       filter tokens with prob < maxProb * minP
 //
-// The fields compose: temperature is applied first, then
-// top-k, then top-p, then softmax, then categorical
-// sampling. With T=1, K=0, P=1, the sampler is the plain
-// categorical.
+// Repetition control:
+//
+//	RepeatPenalty:    scale logits of seen tokens: >0 divide, <0 multiply
+//	FrequencyPenalty: subtract freq * penalty from logits
+//	PresencePenalty:  subtract penalty once if token appeared
+//	RepeatWindow:     how many previous tokens to consider (0 = all)
+//
+// The fields compose: penalties → temperature → top-k → top-p → min-p → softmax → sample.
 type Sampler struct {
-	Temperature float32
-	TopK        int
-	TopP        float32
-	Rand        *rand.Rand // optional; if nil, uses a fresh source per call
+	Temperature      float32
+	TopK             int
+	TopP             float32
+	MinP             float32
+	RepeatPenalty    float32
+	FrequencyPenalty float32
+	PresencePenalty  float32
+	RepeatWindow     int
+	Rand             *rand.Rand
 }
 
 // NewSampler constructs a Sampler with T=1, no top-k, no
@@ -55,56 +65,56 @@ func (s *Sampler) Greedy(logits []float32) int {
 	return bestIdx
 }
 
-// allocRandCounter is an atomic counter used as a seed
-// for the default RNG so multiple goroutines don't collide.
 var allocRandCounter uint64
 
 // Sample returns one token ID sampled from the distribution
-// over logits, applying Temperature, TopK, TopP. The returned
-// integer is in [0, len(logits)). The logits slice is not
-// modified.
-func (s *Sampler) Sample(logits []float32) int {
-	if len(logits) == 0 {
+// over logits. previousTokens carries already-generated tokens
+// for repetition control (nil = no penalty).
+func (s *Sampler) Sample(logits []float32, previousTokens []int) int {
+	n := len(logits)
+	if n == 0 {
 		panic("Sampler.Sample: empty logits")
 	}
-	temperature := s.Temperature
-	if temperature <= 0 {
-		temperature = 1e-5 // T->0 -> greedy
+
+	// Alloc scratch once. defer-free for hot path; free at return.
+	scratch := alloc.Float32(n)
+
+	// 1. Copy logits → scratch.
+	copy(scratch, logits)
+
+	// 2. Repetition penalty. O(window) with uint16-bucketed map.
+	s.applyRepetitionPenalties(scratch, previousTokens)
+
+	// 3. Temperature.
+	temp := s.Temperature
+	if temp <= 0 {
+		temp = 1e-5
 	}
+	if temp != 1.0 {
+		for i := range scratch {
+			scratch[i] /= temp
+		}
+	}
+
+	// 4. Top-k filter.
 	topK := s.TopK
 	if topK < 0 {
 		topK = 0
 	}
-	if topK > len(logits) {
-		topK = len(logits)
+	if topK >= n {
+		topK = 0
 	}
-	topP := s.TopP
-	if topP <= 0 || topP > 1 {
-		topP = 1.0
-	}
-
-	// Step 1: temperature scaling. Copy logits into a
-	// scratch buffer (the input is not modified).
-	scratch := alloc.Float32(len(logits))
-	defer alloc.Free(scratch)
-	for i, v := range logits {
-		scratch[i] = v / temperature
-	}
-
-	// Step 2: top-k. Find the k-th largest value; mask
-	// everything below to -inf.
-	if topK > 0 && topK < len(logits) {
-		kthVal := kthLargest(scratch, topK)
+	if topK > 0 {
+		threshold := kthLargest(scratch, topK)
 		for i, v := range scratch {
-			if v < kthVal {
+			if v < threshold {
 				scratch[i] = float32(math.Inf(-1))
 			}
 		}
 	}
 
-	// Step 3: softmax into a second scratch.
-	probs := alloc.Float32(len(logits))
-	defer alloc.Free(probs)
+	// 5. Softmax into probs buffer.
+	probs := alloc.Float32(n)
 	maxV := scratch[0]
 	for _, v := range scratch[1:] {
 		if v > maxV {
@@ -116,23 +126,26 @@ func (s *Sampler) Sample(logits []float32) int {
 		if math.IsInf(float64(v), -1) {
 			probs[i] = 0
 		} else {
-			probs[i] = float32(math.Exp(float64(v - maxV)))
+			probs[i] = fastexp32(v - maxV)
 			sum += probs[i]
 		}
 	}
 	if sum > 0 {
-		invSum := 1.0 / sum
+		invSum := float32(1.0) / sum
 		for i := range probs {
 			probs[i] *= invSum
 		}
 	}
 
-	// Step 4: top-p. Sort indices by descending prob;
-	// compute cumulative sum; find the cutoff.
+	// 6. Top-p (nucleus).
+	topP := s.TopP
+	if topP <= 0 || topP > 1 {
+		topP = 1.0
+	}
 	if topP < 1.0 {
 		idx := argsortDescF32(probs)
 		cum := float32(0)
-		cutoff := len(probs)
+		cutoff := n
 		for i, k := range idx {
 			cum += probs[k]
 			if cum >= topP {
@@ -140,7 +153,7 @@ func (s *Sampler) Sample(logits []float32) int {
 				break
 			}
 		}
-		for j := cutoff; j < len(probs); j++ {
+		for j := cutoff; j < n; j++ {
 			probs[idx[j]] = 0
 		}
 		var newSum float32
@@ -148,14 +161,41 @@ func (s *Sampler) Sample(logits []float32) int {
 			newSum += v
 		}
 		if newSum > 0 {
-			invSum := 1.0 / newSum
+			invSum := float32(1.0) / newSum
 			for i := range probs {
 				probs[i] *= invSum
 			}
 		}
 	}
 
-	// Step 5: categorical sample.
+	// 7. Min-p filter.
+	minP := s.MinP
+	if minP > 0 {
+		maxProb := float32(0)
+		for _, p := range probs {
+			if p > maxProb {
+				maxProb = p
+			}
+		}
+		threshold := maxProb * minP
+		for i, p := range probs {
+			if p < threshold {
+				probs[i] = 0
+			}
+		}
+		var newSum float32
+		for _, p := range probs {
+			newSum += p
+		}
+		if newSum > 0 {
+			invSum := float32(1.0) / newSum
+			for i := range probs {
+				probs[i] *= invSum
+			}
+		}
+	}
+
+	// 8. Categorical sample.
 	rng := s.Rand
 	if rng == nil {
 		seed := atomic.AddUint64(&allocRandCounter, 1) + uint64(time.Now().UnixNano())
@@ -163,18 +203,68 @@ func (s *Sampler) Sample(logits []float32) int {
 	}
 	r := rng.Float32()
 	var cum float32
+	result := n - 1
 	for i, v := range probs {
 		cum += v
 		if r < cum {
-			return i
+			result = i
+			break
 		}
 	}
-	return len(probs) - 1 // numerical fallback
+
+	alloc.Free(scratch)
+	alloc.Free(probs)
+	return result
 }
 
-// argsortDescF32 returns the indices that would sort probs
-// in descending order. Uses selection sort (O(n^2)); fine
-// for vocab sizes up to ~50k.
+// applyRepetitionPenalties modifies scratch in place.
+// O(window) time, O(unique tokens in window) allocs via Go map
+// (small — typical window=64, vocab is 32k-128k, dedup is ~64 entries).
+func (s *Sampler) applyRepetitionPenalties(scratch []float32, prev []int) {
+	if len(prev) == 0 {
+		return
+	}
+	window := prev
+	if s.RepeatWindow > 0 && len(prev) > s.RepeatWindow {
+		window = prev[len(prev)-s.RepeatWindow:]
+	}
+
+	// Build seen set + frequency map in one pass.
+	seen := make(map[int]bool, len(window))
+	freq := make(map[int]int, len(window))
+	for _, tok := range window {
+		if tok >= 0 && tok < len(scratch) {
+			seen[tok] = true
+			freq[tok]++
+		}
+	}
+
+	rp := s.RepeatPenalty
+	fp := s.FrequencyPenalty
+	pp := s.PresencePenalty
+
+	for tok := range seen {
+		// Repeat penalty: divide if positive, multiply if negative.
+		if rp != 1.0 && rp != 0 {
+			if scratch[tok] > 0 {
+				scratch[tok] /= rp
+			} else {
+				scratch[tok] *= rp
+			}
+		}
+		// Frequency penalty: subtract based on count.
+		if fp != 0 {
+			scratch[tok] -= fp * float32(freq[tok])
+		}
+		// Presence penalty: subtract once.
+		if pp != 0 {
+			scratch[tok] -= pp
+		}
+	}
+}
+
+// argsortDescF32 returns indices sorting probs descending. O(n²)
+// selection sort; fine for vocab ≤ 50k.
 func argsortDescF32(probs []float32) []int {
 	idx := make([]int, len(probs))
 	for i := range idx {
@@ -192,11 +282,9 @@ func argsortDescF32(probs []float32) []int {
 	return idx
 }
 
-// kthLargest returns the k-th largest value in arr. Uses
-// a partial selection sort.
+// kthLargest returns the k-th largest value via partial selection sort.
 func kthLargest(arr []float32, k int) float32 {
 	cp := alloc.Float32(len(arr))
-	defer alloc.Free(cp)
 	copy(cp, arr)
 	for i := 0; i < k; i++ {
 		maxJ := i
@@ -207,5 +295,7 @@ func kthLargest(arr []float32, k int) float32 {
 		}
 		cp[i], cp[maxJ] = cp[maxJ], cp[i]
 	}
-	return cp[k-1]
+	result := cp[k-1]
+	alloc.Free(cp)
+	return result
 }

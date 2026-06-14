@@ -8,7 +8,7 @@ import (
 )
 
 func TestBlock_ForwardShape(t *testing.T) {
-	b := transformer.NewBlock(4, 2, 1, 8, nil, true, transformer.FFNGELU, false, false)
+	b := transformer.NewBlock(4, 2, 1, 8, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
 	x := transformer.NewTensor([]float32{1, 0, 0, 1, 0, 1, 1, 0}, 2, 1, 4)
 	y := b.Forward(x)
 	if y.Rank() != 3 {
@@ -21,7 +21,7 @@ func TestBlock_ForwardShape(t *testing.T) {
 
 func TestBlock_ParamCount(t *testing.T) {
 	// Block has 2 RMSNorms (1 param each) + MHA (4) + MLP (4) = 10 params.
-	b := transformer.NewBlock(4, 2, 1, 8, nil, true, transformer.FFNGELU, false, false)
+	b := transformer.NewBlock(4, 2, 1, 8, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
 	if got := len(b.Params()); got != 10 {
 		t.Errorf("block Params count = %d, want 10", got)
 	}
@@ -36,7 +36,7 @@ func TestBlock_BackwardGradCheck_Wq(t *testing.T) {
 	const dModel, numHeads, numKVHeads, dFF = 4, 2, 1, 8
 	const eps = 0.05
 
-	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false)
+	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
 	xData := []float32{0.5, 1.0, -0.5, 1.0, 0.3, 0.7, -0.3, 0.7}
 	x := transformer.NewTensor(xData, 2, 1, dModel)
 	b.SetMode(transformer.Train)
@@ -93,7 +93,7 @@ func TestBlock_BackwardGradCheck_MlpW1(t *testing.T) {
 	const dModel, numHeads, numKVHeads, dFF = 4, 2, 1, 8
 	const eps = 0.05
 
-	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false)
+	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
 	xData := []float32{0.5, 1.0, -0.5, 1.0, 0.3, 0.7, -0.3, 0.7}
 	x := transformer.NewTensor(xData, 2, 1, dModel)
 	b.SetMode(transformer.Train)
@@ -145,8 +145,8 @@ func TestBlock_GradientCheckpointing(t *testing.T) {
 	dFF := 16
 
 	// Two identical blocks: one with checkpointing, one without.
-	bNoCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false)
-	bCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, true, false)
+	bNoCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
+	bCkpt := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, true, false, 0, 0, 0)
 
 	// Copy weights.
 	for i, p := range bNoCkpt.Params() {
@@ -200,8 +200,8 @@ func TestBlock_FlashAttention(t *testing.T) {
 	dFF := 16
 
 	// Two identical blocks: one with flash, one without.
-	bStd := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false)
-	bFlash := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, true)
+	bStd := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, false, 0, 0, 0)
+	bFlash := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNGELU, false, true, 0, 0, 0)
 
 	// Copy weights.
 	for i, p := range bStd.Params() {
@@ -257,7 +257,7 @@ func TestBlock_SwiGLU(t *testing.T) {
 	numKVHeads := 2
 	dFF := 16
 
-	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNSwiGLU, false, false)
+	b := transformer.NewBlock(dModel, numHeads, numKVHeads, dFF, nil, true, transformer.FFNSwiGLU, false, false, 0, 0, 0)
 
 	xData := make([]float32, 1*1*dModel)
 	for i := range xData {

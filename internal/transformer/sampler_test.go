@@ -33,7 +33,7 @@ func TestSampler_TemperatureZeroApproachesGreedy(t *testing.T) {
 	logits := []float32{1, 5, 3}
 	// Run 100 times; expect index 1 every time.
 	for i := 0; i < 100; i++ {
-		if got := s.Sample(logits); got != 1 {
+		if got := s.Sample(logits, nil); got != 1 {
 			t.Errorf("Sample at T=0: got %d, want 1", got)
 		}
 	}
@@ -48,7 +48,7 @@ func TestSampler_TopK(t *testing.T) {
 	s.Rand = rand.New(rand.NewSource(42))
 	logits := []float32{1, 5, 3, 2, 4}
 	for i := 0; i < 100; i++ {
-		got := s.Sample(logits)
+		got := s.Sample(logits, nil)
 		if got != 1 && got != 4 {
 			t.Errorf("Top-2 sample: got %d, want 1 or 4", got)
 		}

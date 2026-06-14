@@ -1008,3 +1008,78 @@ func TestFitIteratorConfig_EarlyStopping(t *testing.T) {
 		t.Logf("best checkpoint not saved (may not have improved): %v", err)
 	}
 }
+
+func TestTransformer_MLA(t *testing.T) {
+	cfg := relux.ConfigTransformer{
+		VocabSize:  100,
+		DModel:     32,
+		NumHeads:   4,
+		NumKVHeads: 4, // MLA ignores KV heads, set equal to numHeads
+		NumLayers:  2,
+		DFF:        64,
+		MaxSeqLen:  32,
+		RopeBase:   10000,
+		NormEps:    1e-5,
+		Causal:     true,
+		AttnType:   "mla",
+		MLADimC:    32, // 4 × headDim = 4 × 8 = 32
+		MLADimR:    4,  // headDim/2 = 8/2 = 4
+	}
+	tr, err := relux.NewTransformer(cfg)
+	if err != nil {
+		t.Fatalf("NewTransformer MLA: %v", err)
+	}
+
+	// Verify blocks are MLA type.
+	for i, b := range tr.GetBlocks() {
+		if b.AttnType() != transformer.ATTN_MLA {
+			t.Errorf("block %d: want ATTN_MLA, got attnType=%d", i, b.AttnType())
+		}
+		if b.BlockMLA() == nil {
+			t.Errorf("block %d: BlockMLA() is nil", i)
+		}
+		if b.BlockMHA() != nil {
+			t.Errorf("block %d: BlockMHA() should be nil for MLA", i)
+		}
+	}
+
+	// Run a single training step.
+	loss, err := tr.TrainStep([]int{1, 2, 3, 4, 5, 6, 7, 8}, []int{2, 3, 4, 5, 6, 7, 8, 9}, 2)
+	if err != nil {
+		t.Fatalf("MLA TrainStep: %v", err)
+	}
+	t.Logf("MLA training loss: %f", loss)
+
+	// Verify params update.
+	hasGrad := false
+	for _, p := range tr.Params() {
+		for _, g := range p.Grad {
+			if g != 0 {
+				hasGrad = true
+				break
+			}
+		}
+	}
+	if !hasGrad {
+		t.Error("MLA: no non-zero gradients after TrainStep")
+	}
+
+	// Serialize round-trip.
+	var buf bytes.Buffer
+	if err := tr.Save(&buf); err != nil {
+		t.Fatalf("MLA Save: %v", err)
+	}
+	loaded, _, err := relux.LoadTransformer(&buf)
+	if err != nil {
+		t.Fatalf("MLA LoadTransformer: %v", err)
+	}
+	if loaded.Config().AttnType != "mla" {
+		t.Errorf("loaded AttnType: want 'mla', got %q", loaded.Config().AttnType)
+	}
+	// Verify loaded model can run.
+	loss2, err := loaded.TrainStep([]int{1, 2, 3, 4, 5, 6, 7, 8}, []int{2, 3, 4, 5, 6, 7, 8, 9}, 2)
+	if err != nil {
+		t.Fatalf("Loaded MLA TrainStep: %v", err)
+	}
+	t.Logf("Loaded MLA training loss: %f", loss2)
+}

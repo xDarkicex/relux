@@ -1,63 +1,72 @@
 # **RELUX**
-## Mixed-Precision ML in Pure Go
-### MLPs, Transformers, and Custom Layers — bfloat16 Native, rnxa-Accelerated
+## bf16-Native ML Framework in Go
+### Decoder-only transformers, MLPs, off-heap memory, native hardware — zero Python, zero CGO
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/relux)](https://goreportcard.com/report/github.com/xDarkicex/relux)
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/xDarkicex/relux.svg)](https://pkg.go.dev/github.com/xDarkicex/relux)
 
-> A from-scratch Go ML framework with **bf16 mixed precision** as the
-> execution format. Ships an MLP framework (`relux.Network`) and a
-> full decoder-only transformer (`relux.Transformer`): RoPE, GQA, RMSNorm,
-> pre-norm blocks, Adam, bfloat16 weights with float32 gradients and
-> float32 optimizer state. **20–50× faster** on Apple Silicon when paired
-> with the optional [**rnxa**](https://github.com/xDarkicex/rnxa)
-> hardware-acceleration layer (MPS / Metal / CUDA).
+> **relux** is a from-scratch ML framework that runs bf16 natively, stores
+> everything off-heap in mmap'd memory, and talks directly to Apple Silicon's
+> AMX coprocessor through purego shims — no CGO, no Python, no CUDA toolkit.
+>
+> Ships a full decoder-only transformer stack: MLA with 14× KV cache
+> compression, Flash Attention 2, SwiGLU, speculative decoding, gradient
+> checkpointing, and a complete training pipeline. **20–50× faster** on M-series
+> hardware via [**rnxa**](https://github.com/xDarkicex/rnxa).
 
-See [ROADMAP.md](ROADMAP.md) for the current direction and the
-architectural decisions that shape every line of code.
-
----
-
-## Table of Contents
-
-- [Why relux?](#-why-relux)
-- [Hardware Acceleration with rnxa](#-hardware-acceleration-with-rnxa)
-- [Mixed Precision: bf16 Native](#-mixed-precision-bf16-native)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start) — XOR (MLP), Transformer, streaming pipeline
-- [Architecture](#-architecture) — Network, Transformer, modules, data pipeline
-- [Usage Patterns](#-usage-patterns) — production patterns
-- [Model Persistence](#-model-persistence) — v0 (gob) and v1 (binary)
-- [Configuration](#-configuration)
-- [Roadmap](#-roadmap) — see [ROADMAP.md](ROADMAP.md) for the full version
-- [Contributing](#-contributing)
+See [ROADMAP.md](ROADMAP.md) for current direction and architectural decisions.
 
 ---
 
-## 🎯 Why relux?
+## Why relux?
 
-relux is a Go-first ML framework that runs anywhere pure Go runs, with
-optional hardware acceleration through the companion
-[**rnxa**](https://github.com/xDarkicex/rnxa) engine. Two entry points
-share the same `optim.Param` contract and the same numeric types:
+Most ML frameworks sit on top of Python, CUDA, and CGO shims. relux doesn't.
+Everything from the tensor allocator to the attention kernel is written in Go,
+compiled to a single static binary, and runs directly against hardware.
 
-- **`relux.Network`** — the MLP framework. `Dense` layers, activations
-  (ReLU, GELU, Softmax, …), loss functions (MSE, BCE, CCE, …), Adam /
-  SGD, gob-based persistence.
-- **`relux.Transformer`** — a full decoder-only language model. Token
-  embedding, RoPE, MHA with GQA, RMSNorm pre-norm, MLP block, linear
-  head. Forward + backward + Adam step + greedy / top-k / top-p
-  generation. Persists to v1 `.relux` (see [Model Persistence](#-model-persistence)).
+**Four things that make relux different:**
 
-**Mixed precision throughout.** Weights are bfloat16 in memory (the
-active execution format), gradients are float32, Adam's m/v buffers are
-float32. This is the same pattern used by NVIDIA Tensor Cores and Apple
-AMX — 2× memory and bandwidth vs float32. The compute backend dispatches
-all matmul through rnxa (MPS on Apple Silicon, Metal fallback, CUDA on
-Linux), widening bf16 weights to f32 once per call and running the
-actual matmul at native hardware speed.
+**1. bf16 is the execution format, not a storage compression.**
+Weights are `[]uint16` in memory. Matmuls widen to f32 once per call, accumulate
+in f32, and write back — same pattern as NVIDIA Tensor Cores and Apple AMX.
+2× memory and bandwidth vs float32. There is no float64 path. There is no
+"train in f32, quantize to bf16 for inference" step. BF16 all the way down.
+
+**2. Off-heap, mmap'd memory. The Go GC never sees your model.**
+Weights, gradients, activations, and KV caches live in mmap'd regions managed
+by `xDarkicex/memory` — a production sharded freelist allocator. The GC traces
+slice headers (24 bytes), not the 7 GB of weights behind them. KV caches can
+be file-backed: the OS pages cold tokens to SSD and keeps hot tokens in RAM,
+enabling context lengths that would otherwise OOM consumer hardware.
+
+**3. Native hardware. No CGO.**
+rnxa loads `libmps.dylib` through purego and dispatches matmuls directly to
+Apple's AMX coprocessor. If MPS isn't available, hand-written Metal compute
+kernels take over. On Linux, the same dispatcher targets CUDA. The fallback is
+pure Go — no linking, no C toolchain, no `libtorch.so`. One binary.
+
+**4. MLA with compressed KV cache. 14× smaller than standard attention.**
+Multi-head Latent Attention stores a low-rank latent `c^KV` + a small RoPE key
+per position instead of full `[numHeads, headDim]` K/V. Decompression happens
+on-the-fly during attention. Combined with mmap-backed storage, this pushes
+usable context lengths an order of magnitude beyond what standard MHA caches
+can fit in the same memory budget. Full training + inference support.
+
+**Plus the full transformer toolkit:**
+Flash Attention 2 (block-tiled, O(N) memory), SwiGLU FFN (LLaMA/Mistral/
+DeepSeek architectures), GQA, RoPE, gradient checkpointing (activation recompute
+at block boundaries), speculative decoding (2–4× inference speedup), repetition
+penalties, streaming generation, chat templates.
+
+Two entry points share the `optim.Param` contract:
+
+| Entry point | What it is |
+|---|---|
+| `relux.Transformer` | Decoder-only LLM. Full training + inference. `.relux` v1 persistence. |
+| `relux.Network` | Classic MLP. Dense layers, activations, loss functions, gob persistence. |
+
 
 ```go
 // Tiny transformer
@@ -70,97 +79,56 @@ out, _ := t.Generate([]int{1, 2, 3}, 16, 0.8, 3) // prompt, maxNew, temp, topK
 t.SaveFile("model.relux") // v1 format, ~half the size of float32
 ```
 
-### **Performance Metrics**
-| Operation | Pure Go (bf16) | relux + rnxa (MPS) | Impact |
-|-----------|----------------|--------------------|--------|
-| Transformer forward (1k tokens) | 480ms | **38ms** | 12.6× speedup |
-| MLP inference (1k samples) | 2.1s | **80ms** | 26× higher throughput |
-| Memory (1B-param transformer) | 2.4 GB | 2.4 GB + MPS buffers | bf16 storage throughout |
-| Production deployment | Single binary | Single binary | Zero runtime dependencies |
+### Benchmarks (Apple M2 Pro, rnxa MPS backend)
+
+| Operation | Pure Go (bf16) | rnxa (MPS) | Speedup |
+|-----------|----------------|------------|---------|
+| Transformer forward (1k tokens) | 480ms | **38ms** | 12.6× |
+| MLP inference (1k samples) | 2.1s | **80ms** | 26× |
+| Memory (1B-param model) | 2.4 GB | 2.4 GB + MPS | bf16 throughout |
+| Binary size | ~15 MB | ~15 MB | static binary, zero deps |
 
 ---
 
-## ⚡ Hardware Acceleration with **rnxa**
+## Hardware Acceleration via rnxa
 
-The [**rnxa**](https://github.com/xDarkicex/rnxa) acceleration engine provides
-seamless GPU acceleration for production workloads, automatically falling back
-to pure Go when hardware acceleration is unavailable.
+[**rnxa**](https://github.com/xDarkicex/rnxa) provides native hardware access
+without CGO. MPS shims call `libmps.dylib` through purego; Metal compute
+kernels are hand-written WGSL-equivalent shaders compiled to Metal Shading
+Language. Automatic fallback: if hardware isn't available, matmuls run in
+pure Go.
 
 ```text
 ┌────────────────┐    ┌─────────────────┐    ┌──────────────────────┐
-│     relux      │───▶│      rnxa       │───▶│  Hardware Layer      │
-│  (Enterprise   │    │  (Acceleration  │    │  MPS / Metal / CUDA  │
-│   Framework)   │    │    Engine)      │    │       / CPU          │
+│     relux      │───▶│      rnxa       │───▶│  MPS / Metal / CUDA  │
+│  (bf16-native  │    │  (purego, no    │    │  (Apple AMX / NVIDIA │
+│   transformer) │    │   CGO shims)    │    │   Tensor Cores)      │
 └────────────────┘    └─────────────────┘    └──────────────────────┘
 ```
 
-### **Platform Support Matrix**
-- **✅ Apple Silicon (M1/M2/M3+)** – Metal Performance Shaders via rnxa
-  (production-ready; `libmps.dylib` loaded through purego, no CGO)
-- **✅ Apple Silicon (fallback)** – Hand-written Metal compute kernels in
-  rnxa, used automatically when the MPS shim isn't built
-- **✅ Linux (CUDA, code-complete)** – cuBLAS matmul + cuDNN activations /
-  softmax via `libcuda.so` (purego-loaded `nvcc` shim). Awaiting a Linux
-  build agent with `nvcc` + NVIDIA hardware to validate the GPU path
-  end-to-end. The dispatcher and engine wiring are exercised by the
-  relux test sweep on every platform.
-- **✅ Universal Fallback** – Pure Go implementation, always available
-- **🚧 Windows DirectML / CUDA** – Planned via rnxa (a follow-up to the
-  Linux cut; the C ABI is portable, so it's file additions rather than
-  a redesign)
+### Platform Support
 
-### **Backend Selection**
+- **Apple Silicon (M1–M4)** — MPS via `libmps.dylib` (purego-loaded). Metal
+  compute kernel fallback. BF16 matmuls hit the AMX coprocessor.
+- **Linux (CUDA)** — cuBLAS + cuDNN via `libcuda.so` (code-complete, awaiting
+  build agent with NVIDIA hardware for end-to-end validation).
+- **Universal fallback** — Pure Go matmul, always available.
 
-When `WithAcceleration("auto")` is set, `relux` walks rnxa's backend ladder
-on the current platform:
+### Backend Selection
 
-- **macOS:** **MPS → Metal → CPU**
-- **Linux:**  **CUDA → CPU** (Metal / MPS aren't available)
-- **Windows:** **CPU** (CUDA + DirectML are follow-ups)
+rnxa walks a priority ladder at init:
 
-The first backend whose `Available()` is true wins. If a higher-priority
-backend's shim isn't built (e.g. `libmps.dylib` missing on a Mac,
-`libcuda.so` missing on Linux) or the runtime probe finds no hardware
-(`nvidia-smi` returns no GPUs), that backend's `Available()` returns false
-and the dispatcher falls through to the next one. The fallback is
-transparent — no caller-side code change is required.
+- **macOS:** MPS → Metal → CPU
+- **Linux:** CUDA → CPU
+- **Windows:** CPU (DirectML planned)
 
-### **Automatic Backend Selection**
+First backend whose `Available()` is true wins. No caller-side changes needed
+when falling through.
+
 ```go
-// relux automatically detects and uses the best available backend
-net, _ := relux.NewNetwork(
-    relux.WithConfig(config),
-    relux.WithAcceleration("auto"), // Recommended: smart selection
-)
-
-// Check what backend is being used
-benchmark := net.Benchmark()
-fmt.Printf("Backend: %s\n", benchmark.BackendInfo)
-// Output: "rnxa (MPS: Apple M2 Pro)" or "rnxa (Metal: Apple M2 Pro)" or "Pure Go (Native)"
-```
-
-### **Performance Comparison**
-```go
-// Compare different backends
-func compareBenchmarks() {
-    backends := []string{"native", "rnxa", "auto"}
-
-    for _, backend := range backends {
-        net, _ := relux.NewNetwork(
-            relux.WithConfig(config),
-            relux.WithAcceleration(backend),
-        )
-
-        benchmark := net.Benchmark()
-        fmt.Printf("%s: %v (%.1f ops/sec)\n",
-                   backend, benchmark.Duration, benchmark.Throughput)
-    }
-}
-
-// Output (on a Mac with the MPS shim built):
-// native: 3.2ms (312.5 ops/sec) - Pure Go (Native)
-// rnxa:   156µs (6410.3 ops/sec) - rnxa (MPS: Apple M2 Pro)
-// auto:   156µs (6410.3 ops/sec) - rnxa (MPS: Apple M2 Pro)
+// Backend selection is automatic — rnxa walks MPS → Metal → CPU
+t, _ := relux.NewTransformer(cfg)
+// Backend is set during construction; no manual config needed.
 ```
 
 ---
@@ -239,7 +207,7 @@ xcode-select --version
 # Should output: xcode-select version 2410 or higher
 ```
 
-**Enterprise Benefits:**
+**Zero-dependency deployment:**
 - No CGO dependencies
 - No Python runtime requirements
 - No Docker containers needed
@@ -290,12 +258,12 @@ func main() {
                    x, Y[i][0], pred[0])
     }
     
-    // Enterprise monitoring
+    // Backend diagnostics
     fmt.Printf("Backend: %s\n", net.GetBackendInfo())
 }
 ```
 
-**Production Output:**
+**Example output:**
 ```
 Training: 100% |████████████| 5000/5000 epochs (Backend: rnxa-metal)
 Input: [0 0] → Expected: 0, Got: 0.002 ✓
@@ -455,7 +423,7 @@ func main() {
     it := dataset.NewWindowedIterator(allTokens, 1024, 1, 1)
     t.FitIterator(it, 5000, 3e-4, nil)
 
-    // Option B: Full production training with FitIteratorConfig.
+    // Option B: Full training with FitIteratorConfig.
     // Checkpointing, validation, and gradient accumulation.
     trainIter := dataset.NewWindowedIterator(allTokens, 1024, 1, 1)
     valIter := dataset.NewWindowedIterator(valTokens, 1024, 1, 1)
@@ -527,7 +495,7 @@ func main() {
   background pre-fetch)
 - 🔄 **Streaming training**: `Transformer.FitIterator` accepts an
   `Iterator` and trains multi-epoch with auto-reset.
-  `Transformer.FitIteratorConfig` adds full production support:
+  `Transformer.FitIteratorConfig` adds full training support:
   periodic checkpointing, held-out validation, gradient accumulation,
   configurable warmup+cosine LR schedule, AdamW weight decay, early
   stopping on val loss, metrics CSV logging, and epoch callbacks.
@@ -546,94 +514,85 @@ func main() {
   state resume.
 
 ### **Deployment**
-- 🏢 **Zero runtime dependencies** — pure Go with optional rnxa
+- **Zero runtime dependencies** — pure Go with optional rnxa
   acceleration
 - ⚡ **Concurrent batch prediction** — leverages goroutines
 - 🎛️ **Configuration presets** — `SmallMLP`, `MediumMLP`,
   `ClassificationMLP`, `RegressionMLP`
-- 🔒 **Type safety** — compile-time guarantees
-- 📈 **Performance monitoring** — built-in benchmarking
+- **Type safety** — compile-time guarantees
+- **Benchmarking** — built-in throughput measurement
 
 ---
 
-## 📖 Enterprise Usage Patterns
+## Usage Patterns
 
-### **Production Classification Service**
+### Transformer Training
+
 ```go
-// Initialize with enterprise configuration
-net, _ := relux.NewNetwork(
-    relux.WithConfig(relux.ClassificationMLP(4, 3, "medium")),
-    relux.WithAcceleration("auto"),
-    relux.WithSeed(42), // Reproducible for compliance
-)
-
-// Production training with monitoring
-net.Fit(trainingData.X, trainingData.Y,
-    relux.Epochs(1000),
-    relux.BatchSize(32),
-    relux.LearningRate(0.001),
-    relux.EarlyStopping(100), // Prevent overfitting
-    relux.Verbose(true),      // Production logging
-)
-
-// Deploy for high-throughput inference
-predictions, err := net.PredictBatch(productionData)
-if err != nil {
-    log.Printf("Inference error: %v", err)
-    return
+cfg := relux.ConfigTransformer{
+    VocabSize: 32000, DModel: 4096, NumHeads: 32, NumKVHeads: 8,
+    NumLayers: 32, DFF: 11008, MaxSeqLen: 2048,
+    FFNType: "swiglu", AttnType: "mla",
+    MLADimC: 512, MLADimR: 64,
+    FlashAttention: true, GradientCheckpointing: true,
 }
 
-// Enterprise monitoring
-metrics := net.GetMetrics()
-log.Printf("Throughput: %.1f predictions/sec", metrics.Throughput)
-log.Printf("Accuracy: %.2f%%", metrics.Accuracy*100)
+t, _ := relux.NewTransformer(cfg)
+
+// Full training loop.
+loss, _ := t.FitIteratorConfig(trainIter, relux.FitConfig{
+    Steps: 10000, LR: 3e-4, GradAccumSteps: 4,
+    WarmupSteps: 1000, MinLRRatio: 0.1,
+    WeightDecay: 0.1, GradClipNorm: 1.0,
+    CheckpointPath: "ckpt.relv", CheckpointEvery: 500,
+    ValIterator: valIter, ValEvery: 500,
+    EarlyStoppingPatience: 5,
+    MetricsLogPath: "metrics.csv",
+    OnStep: func(step int, loss, ppl float32) {
+        fmt.Printf("step %d: loss=%.4f ppl=%.2f\n", step, loss, ppl)
+    },
+})
+
+t.SaveFile("model.relv")
 ```
 
-### **Advanced Training Configuration**
+### Speculative Decoding
+
 ```go
-// Enterprise training pipeline
-err := net.Fit(X, Y,
-    relux.Epochs(5000),
-    relux.LearningRate(0.01),
-    relux.Momentum(0.9),                    // Convergence stability
-    relux.LearningRateDecay(0.95, 500),     // Adaptive learning
-    relux.EarlyStopping(100),               // Overfitting prevention  
-    relux.GradientClip(2.0),                // Gradient explosion protection
-    relux.BatchSize(64),                    // Optimal for GPU utilization
-    relux.Shuffle(true),                    // Training data randomization
-    relux.Verbose(true),                    // Production monitoring
+draft, _ := relux.NewTransformer(smallCfg)   // 1B draft
+target, _ := relux.NewTransformer(largeCfg)  // 7B target
+
+dec, _ := relux.NewSpeculativeDecoder(draft, target,
+    relux.DefaultSpeculativeConfig(),
 )
+
+tokens, acceptRate, _ := dec.Generate(prompt, 256)
+fmt.Printf("accept rate: %.1f%%\n", acceptRate*100)
 ```
 
-### **Enterprise Model Management**
+### Streaming Generation with Chat
+
 ```go
-// Persistent model storage for production
-modelPath := "/opt/models/production-classifier.gob"
-if err := net.SaveFile(modelPath); err != nil {
-    log.Fatalf("Failed to persist model: %v", err)
+stream := t.GenerateStream(prompt, 256, 0.7, 40, nil)
+for res := range stream {
+    fmt.Print(res.Token)
+    if res.Done {
+        break
+    }
 }
 
-// Production model loading with validation
-prodNet, err := relux.LoadNetwork(modelPath)
-if err != nil {
-    log.Fatalf("Failed to load production model: %v", err)
-}
-
-// Validate loaded model integrity
-if err := prodNet.Validate(); err != nil {
-    log.Fatalf("Model validation failed: %v", err)
-}
-
-// High-availability concurrent inference
-predictions, err := prodNet.PredictBatchConcurrent(requests, 8)
-if err != nil {
-    log.Printf("Batch inference failed: %v", err)
-}
+// Chat formatting.
+tmpl := relux.NewLLaMAChatTemplate()
+prompt := tmpl.Apply([]relux.ChatMessage{
+    {Role: "system", Content: "You are a helpful assistant."},
+    {Role: "user", Content: "Explain MLA attention."},
+})
+```
 ```
 
 ---
 
-## 🆚 Enterprise Framework Comparison
+## Framework Comparison
 
 | Enterprise Criteria | **relux + rnxa** | **PyTorch** | **TensorFlow** | **Gorgonia** |
 |---------------------|------------------|-------------|----------------|--------------|
@@ -644,12 +603,12 @@ if err != nil {
 | **Memory Efficiency** | **<3 MB base** | ~500 MB base | ~1 GB base | ~50 MB base |
 | **GPU Acceleration** | ✅ Native (rnxa) | ✅ CUDA/ROCm | ✅ CUDA/TPU | ❌ |
 | **Apple Silicon Optimization** | ✅ **Metal Native** | ⚠️ Limited | ⚠️ Limited | ❌ |
-| **Enterprise Support** | Open Source | Commercial | Commercial | Community |
+| **Support** | Open Source | Commercial | Commercial | Community |
 | **Compliance Friendly** | ✅ Auditable | ⚠️ Complex | ⚠️ Complex | ⚠️ Limited |
 | **Container Integration** | **Minimal** | Heavy | Very Heavy | Moderate |
-| **Production Monitoring** | ✅ Built-in | External Tools | External Tools | Limited |
+| **Training Metrics** | ✅ Built-in | External Tools | External Tools | Limited |
 
-### **Enterprise Decision Matrix**
+### **Decision Matrix**
 
 **Choose relux + rnxa when:**
 - 🏢 **Go-First Organization**: Existing Go infrastructure and expertise
@@ -1028,14 +987,14 @@ fmt.Printf("rnxa: %s\n", result2)
 fmt.Printf("Speedup: %.1fx faster with rnxa\n", speedup)
 ```
 
-### **Enterprise Monitoring & Introspection**
+### **Monitoring & Introspection**
 
 ```go
-// Comprehensive network analysis for production
+// Comprehensive network analysis
 fmt.Println(net.Summary())
 
-// Example production output:
-// relux.Network Production Summary:
+// Example output:
+// relux.Network Summary:
 // =================================
 // Architecture: 4 → 64(relu) → 32(relu) → 3(softmax)
 // Backend: rnxa (Metal: Apple M2 Pro)
@@ -1043,7 +1002,7 @@ fmt.Println(net.Summary())
 // Expected Throughput: ~8,500 predictions/sec
 // Memory Usage: 2.8 MB + GPU buffers
 // Acceleration: 8.5x over pure Go
-// Status: Production Ready ✅
+// Status: Ready ✅
 
 // Real-time performance monitoring
 benchmark := net.Benchmark()
@@ -1051,13 +1010,13 @@ fmt.Printf("Operation Latency: %v\n", benchmark.Duration)
 fmt.Printf("Throughput: %.1f ops/sec\n", benchmark.Throughput)
 fmt.Printf("Backend Efficiency: %s\n", benchmark.BackendInfo)
 
-// Production health checks
+// Health checks
 health := net.HealthCheck()
 if !health.IsHealthy {
     log.Printf("Model health warning: %s", health.Issues)
 }
 
-// Enterprise compliance reporting
+// Compliance reporting
 report := net.ComplianceReport()
 fmt.Printf("Model Checksum: %s\n", report.Checksum)
 fmt.Printf("Training Provenance: %s\n", report.TrainingInfo)
@@ -1092,7 +1051,7 @@ go build
 
 ---
 
-## 🎯 Enterprise Roadmap
+## Roadmap
 
 The roadmap below reflects the current state of the repository. Items marked
 ✅ have shipped in `master` and are exercised by the test suite. 🔄 items are
@@ -1133,6 +1092,11 @@ in flight. 🔮 items are scoped but not yet started.
 | **Fast attention softmax** | ✅ | Same fastexp32 kernel in MHA softmaxRows, both forward and KV-cached paths |
 | **SwiGLU FFN** | ✅ | `ConfigTransformer.FFNType: "swiglu"` — SiLU-gated FFN for LLaMA/Mistral/DeepSeek architectures |
 | **Flash Attention 2** | ✅ | `ConfigTransformer.FlashAttention` — block-tiled O(seq) forward, online softmax, backward recompute |
+| **MLA (Multi-head Latent Attention)** | ✅ | `ConfigTransformer.AttnType: "mla"` — compressed KV cache (dC+dHR per token), decoupled RoPE, ~14× cache reduction |
+| **Speculative Decoding** | ✅ | `SpeculativeDecoder` — draft model + target verification, 2-4× inference speedup, alloc.Float32 backed |
+| **Streaming Generation** | ✅ | `GenerateStream` — channel-based token streaming with stop conditions |
+| **Repetition Penalties** | ✅ | `Sampler.RepeatPenalty`, `FrequencyPenalty`, `PresencePenalty`, `MinP`, `RepeatWindow` |
+| **Chat Templates** | ✅ | `ChatMLTemplate`, `LLaMAChatTemplate`, `MistralChatTemplate` — conversation formatting |
 | KV-cache inference | ✅ | `Generate` uses bf16 KV-cache; prefill + decode, O(n) per token generation |
 | **.relux v1 binary format** | ✅ | "RELV" magic, CRC32 header, SHA-256 footer, bf16 weights, f32 Adam state |
 | v0 .relux (gob) back compat | ✅ | `Network.Load` sniffs magic; dispatches v0/v1 |
@@ -1173,15 +1137,17 @@ in flight. 🔮 items are scoped but not yet started.
 | Distributed training (data-parallel) | 🔮 | 2027 Q3 | Multi-process, parameter server, gRPC |
 | ONNX import / export | 🔮 | 2027 Q4 | Lower into relux layer graph; round-trip |
 | Multi-GPU rnxa backend | 🔮 | 2027 Q2 | Single-host, multiple MPS / CUDA devices |
-| Enterprise SLA / commercial support | 🔮 | 2027+ | No public timeline yet |
+| Commercial support / SLA | 🔮 | 2027+ | No public timeline yet |
 
 ### **Recent Milestones (reverse-chronological)**
 
+- **2026 Q2** — **Generation system.** `SpeculativeDecoder` accelerates inference 2-4× using a small draft model that speculates multiple tokens ahead, verified in parallel by the target model via modified rejection sampling. All buffers are alloc.Float32 (off-heap). `GenerateStream` provides channel-based token streaming. Sampler gains `RepeatPenalty`, `FrequencyPenalty`, `PresencePenalty`, `MinP`, and `RepeatWindow` for production-quality generation. Chat templates (`ChatMLTemplate`, `LLaMAChatTemplate`, `MistralChatTemplate`) format conversations into model prompts.
+- **2026 Q2** — **MLA (Multi-head Latent Attention).** Compressed KV cache via low-rank joint K/V projection — stores only the latent `c^KV` (dC dims) + decoupled RoPE key `k^R` (dHR dims) per position instead of full `[numHeads, headDim]` K/V. ~14× cache reduction enables consumer-hardware long-context inference. Decoupled RoPE isolates position encoding from content representation; attention score is sum of independent content-content and position-position dot products. Supports training (7 weight matrices), inference with compressed `MLACache` (alloc-backed or mmap/file-backed), gradient checkpointing, and serialization via `.relux` v1 format. Configure with `ConfigTransformer.AttnType: "mla"`, `MLADimC`, `MLADimR`.
 - **2026 Q2** — **SwiGLU FFN.** SiLU-gated feedforward block supporting GELU and SwiGLU variants via `ConfigTransformer.FFNType`. Three-weight architecture (W_up, W_gate, W_down) matching LLaMA 2/3, Mistral, and DeepSeek. Full forward/backward with correct SiLU derivative.
 - **2026 Q2** — **Flash Attention 2.** Block-tiled O(seq) attention with online softmax (Br=Bc=64). Forward never materializes the [seq, seq] matrix; backward recomputes weights from stored Q/K/V. Combines with gradient checkpointing for ~4 KB per head peak memory. Outputs and gradients match standard attention to 1e-4.
 - **2026 Q2** — **Gradient checkpointing + fast kernels.** `ConfigTransformer.GradientCheckpointing` enables activation recompute at block boundaries — memory per block drops from O(seq² + seq×dFF) to O(seq×dModel), all block inputs stored in mmap-backed off-heap memory. Cross-entropy loss and MHA attention softmax use a pure-float32 fastexp32 approximation, eliminating the f32→f64→f32 conversion chain in the hottest loops.
-- **2026 Q2** — **Tier 1+2 production training features.** Configurable LR schedule (explicit warmup + cosine floor), AdamW weight decay, early stopping on validation loss with best-checkpoint restore, CSV metrics log for crash recovery, `ShuffledIterator` for epoch-level shuffle, `PrefetchIterator` for background batch pre-fetch, configurable gradient clipping. Updated stale "no batched matmul" comment — `matmulBatched3D` already handles batched forward/backward.
-- **2026 Q2** — **Production training support.** `FitIteratorConfig` adds periodic checkpointing, held-out validation with perplexity, gradient accumulation for large effective batch sizes, and per-epoch callbacks. Adam state resume works end-to-end: `SetOptimizerState` auto-creates Adam on freshly-loaded transformers, and mid-training checkpoints capture live optimizer state. RoPE overflow guard with `ExtendMaxSeqLen` prevents silent panics on long generations.
+- **2026 Q2** — **Tier 1+2 training features.** Configurable LR schedule (explicit warmup + cosine floor), AdamW weight decay, early stopping on validation loss with best-checkpoint restore, CSV metrics log for crash recovery, `ShuffledIterator` for epoch-level shuffle, `PrefetchIterator` for background batch pre-fetch, configurable gradient clipping. Updated stale "no batched matmul" comment — `matmulBatched3D` already handles batched forward/backward.
+- **2026 Q2** — **Training pipeline.** `FitIteratorConfig` adds periodic checkpointing, held-out validation with perplexity, gradient accumulation for large effective batch sizes, and per-epoch callbacks. Adam state resume works end-to-end: `SetOptimizerState` auto-creates Adam on freshly-loaded transformers, and mid-training checkpoints capture live optimizer state. RoPE overflow guard with `ExtendMaxSeqLen` prevents silent panics on long generations.
 - **2026 Q2** — **KV-cache wired into Generate.** Prefill caches K/V (bf16, pre-GQA-expand) for the full prompt; subsequent decode steps process one token at a time attending over the full cached sequence. Causal mask is correct for both phases. O(n²) total vs O(n³) without cache.
 - **2026 Q2** — **Cross-entropy loss in Transformer.** Replaced MSE-on-logits with softmax + cross-entropy in `TrainStep`. Per-token CE gradient naturally focuses the gradient on the target position; log-sum-exp trick preserves numerical stability for large vocabularies.
 - **2026 Q2** — **Tokenizer + streaming dataset pipeline shipped.** Added
@@ -1223,19 +1189,19 @@ in flight. 🔮 items are scoped but not yet started.
 
 ## 🤝 Open Source Foundation
 
-relux is built on open source principles while targeting enterprise needs. We welcome contributions from the global Go and ML communities.
+relux is built on open source principles targeting AI research needs. We welcome contributions from the global Go and ML communities.
 
 ### **Contribution Areas**
 - **🧠 Core Engine**: New optimizers, layer types, activation functions
 - **⚡ Performance**: Hardware-specific optimizations, memory efficiency
-- **🔧 Enterprise Features**: Monitoring, compliance, deployment tooling
-- **📚 Documentation**: Enterprise guides, compliance documentation
+- **🔧 Tooling**: Monitoring, validation, deployment tooling
+- **📚 Documentation**: Guides, API reference, architecture docs
 - **🧪 Testing**: Platform compatibility, performance benchmarks
 
 ### **Development Environment**
 
 ```bash
-# Enterprise development setup
+# Development setup
 git clone https://github.com/xDarkicex/relux.git
 cd relux
 
@@ -1248,7 +1214,7 @@ go test -tags rnxa ./...
 # Performance benchmarking
 go test -bench=. -benchmem ./...
 
-# Enterprise compliance checks
+# Compliance checks
 go vet ./...
 golangci-lint run
 ```
@@ -1394,19 +1360,19 @@ func argmax(slice []float64) int {
 
 ## 📜 License & Compliance
 
-**Apache License 2.0** – Enterprise-friendly open source license with patent protection.
+**Apache License 2.0** — permissive open source with patent protection.
 
 - ✅ Commercial use permitted
 - ✅ Modification and distribution allowed  
 - ✅ Patent grant included
 - ✅ Liability limitations
-- ✅ Enterprise compliance friendly
+- ✅ Compliance-friendly licensing
 
 See [LICENSE](LICENSE) for complete terms.
 
 ---
 
-## 🏢 Enterprise Support
+## Support
 
 ### **Community Support** (Open Source)
 - 🐛 **Issue Tracking**: [GitHub Issues](https://github.com/xDarkicex/relux/issues)
@@ -1416,7 +1382,7 @@ See [LICENSE](LICENSE) for complete terms.
 
 ### **Commercial Inquiries**
 - 📧 **Enterprise Licensing**: [gentry@xdarkicex.codes]
-- 🏢 **Custom Development**: Specialized features for enterprise deployment
+- 🔧 **Custom Development**: Specialized features and integrations
 - 🎯 **Training & Support**: Go ML implementation consulting
 - 🔒 **Security Assessments**: Compliance and security reviews
 
@@ -1427,25 +1393,25 @@ See [LICENSE](LICENSE) for complete terms.
 ### **Technical Foundation**
 - **[rnxa Project](https://github.com/xDarkicex/rnxa)** – Hardware acceleration engine
 - **Apple Metal Performance Shaders** – GPU acceleration infrastructure  
-- **Go Team** – Language design enabling enterprise ML deployments
+- **Go Team** — language design enabling systems-level ML
 
 ### **Historical Context**
-- **Legacy neuron.go** – [8-year evolution](https://github.com/xDarkicex/GO-Portfolio/blob/master/app/neuron/neuron.go) from experimental code to enterprise framework
+- **Legacy neuron.go** – [8-year evolution](https://github.com/xDarkicex/GO-Portfolio/blob/master/app/neuron/neuron.go) from experimental code to research framework
 - **Open Source ML Community** – Mathematical foundations and algorithmic insights
 
 ---
 
 <div align="center">
 
-**🚀 Enterprise-Grade Neural Networks in Pure Go 🚀**
+**bf16-native transformer training & inference in Go**
 
 *Powered by [rnxa](https://github.com/xDarkicex/rnxa) Hardware Acceleration*
 
-⭐ **Star this repository if relux accelerates your enterprise ML initiatives** ⭐
+⭐ **Star this repo if relux is useful to your research** ⭐
 
 ---
 
-**Built for Enterprise. Powered by Go. Accelerated by Hardware.**
+**Research-backed. Go-native. Hardware-accelerated.**
 
 *© 2025 relux. Licensed under Apache 2.0.*
 

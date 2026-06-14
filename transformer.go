@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"strings"
 
 	"github.com/xDarkicex/relux/dataset"
 	"github.com/xDarkicex/relux/internal/compute"
@@ -108,6 +109,20 @@ type ConfigTransformer struct {
 	// SwiGLU: (SiLU(xW_up) ⊙ xW_gate) W_down — the standard
 	// FFN in LLaMA 2/3, Mistral, and DeepSeek.
 	FFNType string
+
+	// AttnType selects the attention variant. "mha" (default)
+	// uses standard multi-head attention. "mla" uses multi-head
+	// latent attention with compressed KV cache.
+	AttnType string
+
+	// MLADimC is the KV compression dimension for MLA. Typically
+	// 4× headDim (e.g., 512 for headDim=128). 0 means auto.
+	MLADimC int
+
+	// MLADimR is the per-head RoPE dimension for decoupled RoPE
+	// in MLA. Typically headDim/2 (e.g., 64 for headDim=128).
+	// 0 means auto. Must be even.
+	MLADimR int
 }
 
 // FitConfig configures a training run via FitIteratorConfig.
@@ -204,9 +219,22 @@ func NewTransformer(cfg ConfigTransformer) (*Transformer, error) {
 	if cfg.FFNType == "swiglu" {
 		ffnType = transformer.FFNSwiGLU
 	}
+	attnType := transformer.ATTN_MHA
+	dC := cfg.MLADimC
+	dHR := cfg.MLADimR
+	if cfg.AttnType == "mla" {
+		attnType = transformer.ATTN_MLA
+		headDim := cfg.DModel / cfg.NumHeads
+		if dC <= 0 {
+			dC = 4 * headDim
+		}
+		if dHR <= 0 {
+			dHR = headDim / 2
+		}
+	}
 	for i := 0; i < cfg.NumLayers; i++ {
 		t.blocks = append(t.blocks,
-			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, ffnType, cfg.GradientCheckpointing, cfg.FlashAttention))
+			transformer.NewBlock(cfg.DModel, cfg.NumHeads, cfg.NumKVHeads, cfg.DFF, rope, cfg.Causal, ffnType, cfg.GradientCheckpointing, cfg.FlashAttention, attnType, dC, dHR))
 	}
 	// lmHead: a single linear mapping dModel -> vocabSize.
 	// (We use the Linear primitive, not MLP, because MLP's
@@ -874,41 +902,290 @@ func (t *Transformer) Generate(prompt []int, maxNew int, temperature float32, to
 	}
 	t.SetMode(transformer.Inference)
 
-	// Create KV-cache (bf16, pre-allocated for MaxSeqLen) and wire into blocks.
-	cache := transformer.NewKVCacheSized(
-		len(t.blocks), t.config.MaxSeqLen,
-		t.config.NumKVHeads, t.config.DModel/t.config.NumHeads,
-		transformer.BFloat16,
-	)
-	for i, b := range t.blocks {
-		mha := b.BlockMHA()
-		mha.Cache = cache
-		mha.LayerIdx = i
-	}
-	defer func() {
-		for _, b := range t.blocks {
-			b.BlockMHA().Cache = nil
+	// Create KV-cache and wire into blocks. For MLA, use the
+	// compressed MLACache; for MHA, use the standard KVCache.
+	if t.config.AttnType == "mla" {
+		headDim := t.config.DModel / t.config.NumHeads
+		dC := t.config.MLADimC
+		if dC <= 0 {
+			dC = 4 * headDim
 		}
-		cache.Reset()
-	}()
+		dHR := t.config.MLADimR
+		if dHR <= 0 {
+			dHR = headDim / 2
+		}
+		mlaCache := transformer.NewMLACache(
+			len(t.blocks), t.config.MaxSeqLen, dC, dHR,
+		)
+		for i, b := range t.blocks {
+			mla := b.BlockMLA()
+			mla.Cache = mlaCache
+			mla.LayerIdx = i
+		}
+		defer func() {
+			for _, b := range t.blocks {
+				b.BlockMLA().Cache = nil
+			}
+			mlaCache.Reset()
+		}()
+	} else {
+		cache := transformer.NewKVCacheSized(
+			len(t.blocks), t.config.MaxSeqLen,
+			t.config.NumKVHeads, t.config.DModel/t.config.NumHeads,
+			transformer.BFloat16,
+		)
+		for i, b := range t.blocks {
+			mha := b.BlockMHA()
+			mha.Cache = cache
+			mha.LayerIdx = i
+		}
+		defer func() {
+			for _, b := range t.blocks {
+				b.BlockMHA().Cache = nil
+			}
+			cache.Reset()
+		}()
+	}
 
 	// Prefill: compute + cache K/V for the full prompt.
 	prefillLogits := t.Forward(prompt, 1)
 	prefillData, _ := prefillLogits.ToF32()
 	vocab := prefillLogits.Shape()[2]
 	lastPos := len(prompt) - 1
-	next := sampler.Sample(prefillData[lastPos*vocab : (lastPos+1)*vocab])
+	next := sampler.Sample(prefillData[lastPos*vocab : (lastPos+1)*vocab], nil)
 	out := append(append([]int{}, prompt...), next)
 
 	// Decode loop: one token at a time from the cache.
 	for i := 1; i < maxNew; i++ {
 		logits := t.Forward([]int{next}, 1)
 		logitsData, _ := logits.ToF32()
-		next = sampler.Sample(logitsData[:vocab])
+		next = sampler.Sample(logitsData[:vocab], out)
 		out = append(out, next)
 	}
 	return out, nil
 }
+
+// GenerateResult is a single token from streaming generation.
+type GenerateResult struct {
+	Token   string // decoded token text
+	TokenID int    // token ID
+	Done    bool   // generation complete
+	Reason  string // "eos", "max_tokens", or "stop_token"
+}
+
+// GenerateStream runs autoregressive generation and streams tokens
+// through a channel. The channel is closed when generation completes.
+// Callers must drain the channel to avoid goroutine leaks.
+func (t *Transformer) GenerateStream(prompt []int, maxNew int, temperature float32, topK int, rng *rand.Rand) <-chan GenerateResult {
+	ch := make(chan GenerateResult, 1)
+	go func() {
+		defer close(ch)
+		tokens, _ := t.generateWithCallback(prompt, maxNew, temperature, topK, rng, func(res GenerateResult) bool {
+			ch <- res
+			return !res.Done
+		})
+		_ = tokens
+	}()
+	return ch
+}
+
+// generateWithCallback runs autoregressive generation, calling cb for
+// each generated token. Used by both Generate and GenerateStream.
+func (t *Transformer) generateWithCallback(prompt []int, maxNew int, temperature float32, topK int, rng *rand.Rand, cb func(GenerateResult) bool) ([]int, error) {
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	sampler := &transformer.Sampler{
+		Temperature: temperature,
+		TopK:        topK,
+		TopP:        1.0,
+		Rand:        rng,
+	}
+	t.SetMode(transformer.Inference)
+
+	// Create KV-cache and wire into blocks.
+	if t.config.AttnType == "mla" {
+		headDim := t.config.DModel / t.config.NumHeads
+		dC := t.config.MLADimC
+		if dC <= 0 {
+			dC = 4 * headDim
+		}
+		dHR := t.config.MLADimR
+		if dHR <= 0 {
+			dHR = headDim / 2
+		}
+		mlaCache := transformer.NewMLACache(len(t.blocks), t.config.MaxSeqLen, dC, dHR)
+		for i, b := range t.blocks {
+			mla := b.BlockMLA()
+			mla.Cache = mlaCache
+			mla.LayerIdx = i
+		}
+		defer func() {
+			for _, b := range t.blocks {
+				b.BlockMLA().Cache = nil
+			}
+			mlaCache.Reset()
+		}()
+	} else {
+		cache := transformer.NewKVCacheSized(len(t.blocks), t.config.MaxSeqLen,
+			t.config.NumKVHeads, t.config.DModel/t.config.NumHeads, transformer.BFloat16)
+		for i, b := range t.blocks {
+			mha := b.BlockMHA()
+			mha.Cache = cache
+			mha.LayerIdx = i
+		}
+		defer func() {
+			for _, b := range t.blocks {
+				b.BlockMHA().Cache = nil
+			}
+			cache.Reset()
+		}()
+	}
+
+	// Prefill.
+	prefillLogits := t.Forward(prompt, 1)
+	prefillData, _ := prefillLogits.ToF32()
+	vocab := prefillLogits.Shape()[2]
+	lastPos := len(prompt) - 1
+
+	next := sampler.Sample(prefillData[lastPos*vocab:(lastPos+1)*vocab], nil)
+	out := append(append([]int{}, prompt...), next)
+
+	eosID := -1
+	for i := 1; i < maxNew; i++ {
+		logits := t.Forward([]int{next}, 1)
+		logitsData, _ := logits.ToF32()
+
+		next = sampler.Sample(logitsData[:vocab], out)
+
+		done := false
+		reason := ""
+		if next == eosID {
+			done = true
+			reason = "eos"
+		} else if i >= maxNew-1 {
+			done = true
+			reason = "max_tokens"
+		}
+
+		tokenStr := fmt.Sprintf("[%d]", next)
+		if !cb(GenerateResult{Token: tokenStr, TokenID: next, Done: done, Reason: reason}) {
+			return out, nil
+		}
+		if done {
+			return out, nil
+		}
+		out = append(out, next)
+	}
+	return out, nil
+}
+
+// ChatMessage is a single message in a conversation.
+type ChatMessage struct {
+	Role    string // "system", "user", "assistant"
+	Content string
+}
+
+// ChatTemplate formats messages into a model prompt.
+type ChatTemplate interface {
+	Apply(messages []ChatMessage) string
+	Name() string
+}
+
+// ChatMLTemplate formats messages in ChatML format (OpenAI / DeepSeek).
+// Format: <|im_start|>role\ncontent<|im_end|>\n
+type ChatMLTemplate struct{}
+
+func (c *ChatMLTemplate) Apply(messages []ChatMessage) string {
+	var sb strings.Builder
+	for _, msg := range messages {
+		sb.WriteString("<|im_start|>")
+		sb.WriteString(msg.Role)
+		sb.WriteString("\n")
+		sb.WriteString(msg.Content)
+		sb.WriteString("<|im_end|>\n")
+	}
+	sb.WriteString("<|im_start|>assistant\n")
+	return sb.String()
+}
+func (c *ChatMLTemplate) Name() string { return "ChatML" }
+
+// LLaMAChatTemplate formats messages in LLaMA chat format.
+// Format: <s>[INST] <<SYS>>\nsystem\n<</SYS>>\n\nuser [/INST]
+type LLaMAChatTemplate struct{ bosToken, eosToken string }
+
+func NewLLaMAChatTemplate() *LLaMAChatTemplate {
+	return &LLaMAChatTemplate{bosToken: "<s>", eosToken: "</s>"}
+}
+func (l *LLaMAChatTemplate) Apply(messages []ChatMessage) string {
+	var sb strings.Builder
+	sb.WriteString(l.bosToken)
+	var systemPrompt string
+	var conversation []ChatMessage
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			systemPrompt = msg.Content
+		} else {
+			conversation = append(conversation, msg)
+		}
+	}
+	for i, msg := range conversation {
+		switch msg.Role {
+		case "user":
+			sb.WriteString("[INST] ")
+			if i == 0 && systemPrompt != "" {
+				sb.WriteString("<<SYS>>\n")
+				sb.WriteString(systemPrompt)
+				sb.WriteString("\n<</SYS>>\n\n")
+			}
+			sb.WriteString(msg.Content)
+			sb.WriteString(" [/INST]")
+		case "assistant":
+			sb.WriteString(" ")
+			sb.WriteString(msg.Content)
+			sb.WriteString(l.eosToken)
+			sb.WriteString(l.bosToken)
+		}
+	}
+	return sb.String()
+}
+func (l *LLaMAChatTemplate) Name() string { return "LLaMA" }
+
+// MistralChatTemplate formats messages in Mistral chat format.
+type MistralChatTemplate struct{ bosToken, eosToken string }
+
+func NewMistralChatTemplate() *MistralChatTemplate {
+	return &MistralChatTemplate{bosToken: "<s>", eosToken: "</s>"}
+}
+func (m *MistralChatTemplate) Apply(messages []ChatMessage) string {
+	var sb strings.Builder
+	sb.WriteString(m.bosToken)
+	for i, msg := range messages {
+		switch msg.Role {
+		case "user":
+			sb.WriteString("[INST] ")
+			sb.WriteString(msg.Content)
+			sb.WriteString(" [/INST]")
+		case "assistant":
+			if i > 0 {
+				sb.WriteString(" ")
+			}
+			sb.WriteString(msg.Content)
+			sb.WriteString(m.eosToken)
+			if i < len(messages)-1 {
+				sb.WriteString(m.bosToken)
+			}
+		case "system":
+			if i == 0 {
+				sb.WriteString("[INST] ")
+				sb.WriteString(msg.Content)
+				sb.WriteString(" [/INST]")
+			}
+		}
+	}
+	return sb.String()
+}
+func (m *MistralChatTemplate) Name() string { return "Mistral" }
 
 // Config returns the transformer's config. Useful for
 // serialization / debug.

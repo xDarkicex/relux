@@ -184,6 +184,25 @@ func (r *V1Reader) ReadArchEntry() (tag uint8, dims []uint32, floats []float32, 
 			return 0, nil, nil, err
 		}
 		return tag, []uint32{in, out}, nil, nil
+	case LayerTagMLA:
+		// [u32 dModel, u32 numHeads, u32 dC, u32 dHR]
+		d, err := r.readU32()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		nh, err := r.readU32()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		dc, err := r.readU32()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		dhr, err := r.readU32()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return tag, []uint32{d, nh, dc, dhr}, nil, nil
 	default:
 		return 0, nil, nil, fmt.Errorf("v1: unknown arch tag %d at offset %d", tag, r.bytesRead)
 	}

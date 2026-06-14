@@ -86,11 +86,20 @@ func writeTransformerV1(w io.Writer, t *Transformer, state *optim.State) error {
 			[]float32{b.NormAttn().Eps()}); err != nil {
 			return fmt.Errorf("block %d normAttn arch: %w", i, err)
 		}
-		// MHA
-		if err := wr.WriteArchEntry(serialize.LayerTagMHA,
-			[]uint32{uint32(cfg.DModel), uint32(cfg.NumHeads), uint32(cfg.NumKVHeads), uint32(headDim)},
-			nil); err != nil {
-			return fmt.Errorf("block %d mha arch: %w", i, err)
+		// Attention (MHA or MLA)
+		if b.AttnType() == transformer.ATTN_MLA {
+			mlab := b.BlockMLA()
+			if err := wr.WriteArchEntry(serialize.LayerTagMLA,
+				[]uint32{uint32(cfg.DModel), uint32(cfg.NumHeads), uint32(mlab.DC()), uint32(mlab.DHR())},
+				nil); err != nil {
+				return fmt.Errorf("block %d mla arch: %w", i, err)
+			}
+		} else {
+			if err := wr.WriteArchEntry(serialize.LayerTagMHA,
+				[]uint32{uint32(cfg.DModel), uint32(cfg.NumHeads), uint32(cfg.NumKVHeads), uint32(headDim)},
+				nil); err != nil {
+				return fmt.Errorf("block %d mha arch: %w", i, err)
+			}
 		}
 		// Pre-MLP norm
 		if err := wr.WriteArchEntry(serialize.LayerTagRMSNorm,
@@ -104,13 +113,19 @@ func writeTransformerV1(w io.Writer, t *Transformer, state *optim.State) error {
 			nil); err != nil {
 			return fmt.Errorf("block %d mlp arch: %w", i, err)
 		}
-		// Block weights: normAttn.gamma, mha.Wq Wk Wv Wo,
+		// Block weights: normAttn.gamma, attn weights,
 		// normMlp.gamma, mlp.W1 b1 W2 b2
 		if err := writeRMSNormWeights(wr, b.NormAttn()); err != nil {
 			return fmt.Errorf("block %d normAttn weights: %w", i, err)
 		}
-		if err := writeMHAWeights(wr, b.BlockMHA()); err != nil {
-			return fmt.Errorf("block %d mha weights: %w", i, err)
+		if b.AttnType() == transformer.ATTN_MLA {
+			if err := writeMLAWeights(wr, b.BlockMLA()); err != nil {
+				return fmt.Errorf("block %d mla weights: %w", i, err)
+			}
+		} else {
+			if err := writeMHAWeights(wr, b.BlockMHA()); err != nil {
+				return fmt.Errorf("block %d mha weights: %w", i, err)
+			}
 		}
 		if err := writeRMSNormWeights(wr, b.NormMlp()); err != nil {
 			return fmt.Errorf("block %d normMlp weights: %w", i, err)
@@ -261,17 +276,23 @@ func readTransformerV1(r io.Reader) (*Transformer, *optim.State, error) {
 		return nil, nil, fmt.Errorf("read block 0 normAttn: tag %d, want RMSNorm=%d", tag, serialize.LayerTagRMSNorm)
 	}
 	normEps := floats[0]
-	// MHA arch
+	// Attention arch (MHA or MLA).
 	tag, dims, _, err = rdr.ReadArchEntry()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read block 0 mha arch: %w", err)
+		return nil, nil, fmt.Errorf("read block 0 attn arch: %w", err)
 	}
-	if tag != serialize.LayerTagMHA {
-		return nil, nil, fmt.Errorf("read block 0 mha: tag %d, want MHA=%d", tag, serialize.LayerTagMHA)
+	mlaDetected := tag == serialize.LayerTagMLA
+	if tag != serialize.LayerTagMHA && tag != serialize.LayerTagMLA {
+		return nil, nil, fmt.Errorf("read block 0 attn: tag %d, want MHA=%d or MLA=%d", tag, serialize.LayerTagMHA, serialize.LayerTagMLA)
 	}
 	numHeads := int(dims[1])
 	numKVHeads := int(dims[2])
-	_ = dims[3] // headDim, must match
+	var mlaDimC, mlaDimR int
+	if mlaDetected {
+		mlaDimC = int(dims[2])
+		mlaDimR = int(dims[3])
+		numKVHeads = numHeads // MLA doesn't use KV heads
+	}
 	// normMlp arch
 	tag, _, _, err = rdr.ReadArchEntry()
 	if err != nil {
@@ -302,6 +323,11 @@ func readTransformerV1(r io.Reader) (*Transformer, *optim.State, error) {
 		NormEps:    normEps,
 		Causal:     true,
 	}
+	if mlaDetected {
+		cfg.AttnType = "mla"
+		cfg.MLADimC = mlaDimC
+		cfg.MLADimR = mlaDimR
+	}
 	t, err := NewTransformer(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("construct transformer: %w", err)
@@ -315,13 +341,18 @@ func readTransformerV1(r io.Reader) (*Transformer, *optim.State, error) {
 	// bf16; the in-memory master is also bf16 (per the
 	// optim.Param contract). Direct copy.
 	t.GetEmbedding().GetParam().Data = embedW
-	// Read block 0 weights: normAttn.gamma, mha.Wq Wk Wv Wo,
-	// normMlp.gamma, mlp.W1 b1 W2 b2
+	// Read block 0 weights.
 	if err := readRMSNormWeights(rdr, t.GetBlocks()[0].NormAttn()); err != nil {
 		return nil, nil, fmt.Errorf("read block 0 normAttn weight: %w", err)
 	}
-	if err := readMHAWeights(rdr, t.GetBlocks()[0].BlockMHA()); err != nil {
-		return nil, nil, fmt.Errorf("read block 0 mha weights: %w", err)
+	if mlaDetected {
+		if err := readMLAWeights(rdr, t.GetBlocks()[0].BlockMLA()); err != nil {
+			return nil, nil, fmt.Errorf("read block 0 mla weights: %w", err)
+		}
+	} else {
+		if err := readMHAWeights(rdr, t.GetBlocks()[0].BlockMHA()); err != nil {
+			return nil, nil, fmt.Errorf("read block 0 mha weights: %w", err)
+		}
 	}
 	if err := readRMSNormWeights(rdr, t.GetBlocks()[0].NormMlp()); err != nil {
 		return nil, nil, fmt.Errorf("read block 0 normMlp weight: %w", err)
@@ -335,9 +366,9 @@ func readTransformerV1(r io.Reader) (*Transformer, *optim.State, error) {
 		if _, _, _, err = rdr.ReadArchEntry(); err != nil {
 			return nil, nil, fmt.Errorf("read block %d normAttn arch: %w", i, err)
 		}
-		// mha arch
+		// attn arch (MHA or MLA)
 		if _, _, _, err = rdr.ReadArchEntry(); err != nil {
-			return nil, nil, fmt.Errorf("read block %d mha arch: %w", i, err)
+			return nil, nil, fmt.Errorf("read block %d attn arch: %w", i, err)
 		}
 		// normMlp arch
 		if _, _, _, err = rdr.ReadArchEntry(); err != nil {
@@ -352,8 +383,14 @@ func readTransformerV1(r io.Reader) (*Transformer, *optim.State, error) {
 		if err := readRMSNormWeights(rdr, b.NormAttn()); err != nil {
 			return nil, nil, fmt.Errorf("read block %d normAttn weight: %w", i, err)
 		}
-		if err := readMHAWeights(rdr, b.BlockMHA()); err != nil {
-			return nil, nil, fmt.Errorf("read block %d mha weights: %w", i, err)
+		if mlaDetected {
+			if err := readMLAWeights(rdr, b.BlockMLA()); err != nil {
+				return nil, nil, fmt.Errorf("read block %d mla weights: %w", i, err)
+			}
+		} else {
+			if err := readMHAWeights(rdr, b.BlockMHA()); err != nil {
+				return nil, nil, fmt.Errorf("read block %d mha weights: %w", i, err)
+			}
 		}
 		if err := readRMSNormWeights(rdr, b.NormMlp()); err != nil {
 			return nil, nil, fmt.Errorf("read block %d normMlp weight: %w", i, err)
@@ -418,6 +455,29 @@ func writeMHAWeights(wr *serialize.V1Writer, m *transformer.MHA) error {
 	return wr.WriteWeight(m.WoParam().Data)
 }
 
+// writeMLAWeights writes W_Q, W_DKV, W_UK, W_UV, W_KR, W_QR, W_O.
+func writeMLAWeights(wr *serialize.V1Writer, m *transformer.MLA) error {
+	if err := wr.WriteWeight(m.WQParam().Data); err != nil {
+		return err
+	}
+	if err := wr.WriteWeight(m.WDKVParam().Data); err != nil {
+		return err
+	}
+	if err := wr.WriteWeight(m.WUKParam().Data); err != nil {
+		return err
+	}
+	if err := wr.WriteWeight(m.WUVParam().Data); err != nil {
+		return err
+	}
+	if err := wr.WriteWeight(m.WKRParam().Data); err != nil {
+		return err
+	}
+	if err := wr.WriteWeight(m.WQRParam().Data); err != nil {
+		return err
+	}
+	return wr.WriteWeight(m.WOParam().Data)
+}
+
 // writeMLPWeights writes W1, b1, W2, b2.
 func writeMLPWeights(wr *serialize.V1Writer, m *transformer.MLP) error {
 	if err := wr.WriteWeight(m.W1Param().Data); err != nil {
@@ -474,6 +534,47 @@ func readMHAWeights(rdr *serialize.V1Reader, m *transformer.MHA) error {
 	m.WkParam().Data = wk
 	m.WvParam().Data = wv
 	m.WoParam().Data = wo
+	return nil
+}
+
+// readMLAWeights reads W_Q, W_DKV, W_UK, W_UV, W_KR, W_QR, W_O
+// and installs each in place.
+func readMLAWeights(rdr *serialize.V1Reader, m *transformer.MLA) error {
+	wq, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wdkv, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wuk, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wuv, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wkr, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wqr, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	wo, err := rdr.ReadWeight()
+	if err != nil {
+		return err
+	}
+	m.WQParam().Data = wq
+	m.WDKVParam().Data = wdkv
+	m.WUKParam().Data = wuk
+	m.WUVParam().Data = wuv
+	m.WKRParam().Data = wkr
+	m.WQRParam().Data = wqr
+	m.WOParam().Data = wo
 	return nil
 }
 
