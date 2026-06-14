@@ -162,11 +162,10 @@ func (t *Transformer) Params() []optim.Param {
 // with the given input token IDs. The output shape is
 // [seq, vocabSize] in float32.
 //
-// The Transformer is set to Train mode for the duration
-// of the call; callers are expected to call SetMode to
-// switch back to Inference if needed.
+// The Transformer preserves the current mode. Callers
+// should call SetMode(Train) before training and
+// SetMode(Inference) before generation.
 func (t *Transformer) Forward(tokens []int) *transformer.Tensor {
-	t.setMode(transformer.Train)
 	// 1. Embed
 	h := t.embed.Forward(tokens)
 	// h is shape [seq, dModel]. MHA/Block want [batch,
@@ -229,6 +228,7 @@ func (t *Transformer) TrainStep(input, target []int) (float32, error) {
 	if len(input) == 0 {
 		return 0, errors.New("relux.Transformer.TrainStep: empty input")
 	}
+	t.setMode(transformer.Train)
 	logits := t.Forward(input)
 	logitsData, _ := logits.ToF32()
 	seq := len(input)
@@ -367,27 +367,53 @@ func (t *Transformer) Fit(dataset [][]int, seqLen int, steps int, lr float32, rn
 // is exhausted and steps remain, Reset is called to begin another
 // epoch.
 //
+// Learning rate follows a warmup + cosine decay schedule:
+//
+//   - warmup (first 10% of steps): linear ramp 0 → lr
+//   - cosine decay (remaining 90%): lr → 0.1×lr
+//
 // Batches are processed one sequence at a time through TrainStep
 // (no batched matmul). Batched forward/backward is deferred to a
 // dedicated follow-up project.
-func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, rng *rand.Rand) (float32, error) {
+//
+// If onStep is non-nil it is called after every optimizer step
+// with (step, loss, perplexity).
+func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, rng *rand.Rand, onStep func(step int, loss float32, ppl float32)) (float32, error) {
 	if steps <= 0 {
 		return 0, errors.New("relux.Transformer.FitIterator: steps must be > 0")
 	}
 	if rng == nil {
 		rng = rand.New(rand.NewSource(1))
 	}
+	peakLR := lr
 	if t.adam == nil {
 		t.adam = &optim.Adam{
-			LR:    lr,
+			LR:    peakLR,
 			Beta1: 0.9,
 			Beta2: 0.999,
 			Eps:   1e-8,
 		}
 	}
+	// Warmup: 10% of total steps. For runs shorter than
+	// 1000 steps the warmup ramp would consume too much
+	// of the training budget relative to the tiny model
+	// size, so we use constant LR.
+	warmupSteps := 0
+	if steps >= 1000 {
+		warmupSteps = steps / 10
+	}
 	var totalLoss float32
 	validSteps := 0
 	for step := 0; step < steps; step++ {
+		// LR schedule.
+		if warmupSteps > 0 && step < warmupSteps {
+			// Linear warmup: 0 → peakLR.
+			t.adam.LR = peakLR * float32(step+1) / float32(warmupSteps)
+		} else if warmupSteps > 0 {
+			// Cosine decay: peakLR → 0.1×peakLR.
+			progress := float32(step-warmupSteps) / float32(steps-warmupSteps)
+			t.adam.LR = peakLR * (0.1 + 0.45*(1.0+float32(math.Cos(float64(math.Pi*progress)))))
+		}
 		batch, err := iter.Next()
 		if err == io.EOF {
 			iter.Reset()
@@ -416,6 +442,10 @@ func (t *Transformer) FitIterator(iter dataset.Iterator, steps int, lr float32, 
 			t.adam.Step(t.Params())
 			totalLoss += loss
 			validSteps++
+			if onStep != nil {
+				ppl := float32(math.Exp(float64(loss / float32(len(input)))))
+				onStep(validSteps, loss, ppl)
+			}
 		}
 	}
 	t.optimState = stateFromAdam(t.adam)

@@ -13,7 +13,7 @@ import (
 func TestTransformer_Construction(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  100,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -41,7 +41,7 @@ func TestTransformer_ParamCount(t *testing.T) {
 	// Total: 2*10 + 4 = 24.
 	cfg := relux.ConfigTransformer{
 		VocabSize:  100,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -60,7 +60,7 @@ func TestTransformer_ParamCount(t *testing.T) {
 func TestTransformer_ForwardShape(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  100,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -85,7 +85,7 @@ func TestTransformer_ForwardShape(t *testing.T) {
 func TestTransformer_Generate(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  100,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -122,7 +122,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 	// initial transient).
 	cfg := relux.ConfigTransformer{
 		VocabSize:  20,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -157,7 +157,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 
 	// Train. The full backward chain is now wired, so the
 	// blocks' params get updated, not just the lmHead.
-	_, err = tr.Fit(dataset, 8, 300, 0.02, nil)
+	_, err = tr.Fit(dataset, 8, 800, 0.01, nil)
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 func TestTransformer_V1RoundTrip(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  20,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -270,7 +270,7 @@ func TestTransformer_V1RoundTrip(t *testing.T) {
 func TestTransformer_V1EndToEndTraining(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  20,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -368,7 +368,7 @@ func TestTransformer_V1FileHeader(t *testing.T) {
 func TestTransformer_FitIterator(t *testing.T) {
 	cfg := relux.ConfigTransformer{
 		VocabSize:  20,
-		DModel:     16,
+		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
@@ -403,9 +403,10 @@ func TestTransformer_FitIterator(t *testing.T) {
 	// Train via FitIterator.
 	avgLoss, err := tr.FitIterator(
 		dataset.NewWindowedIterator(tokens, 8, 1, 1),
-		200,     // steps
+		500,     // steps
 		0.01,    // learning rate
-		nil,     // default RNG
+		rand.New(rand.NewSource(42)), // seeded RNG
+		nil,     // no progress callback
 	)
 	if err != nil {
 		t.Fatalf("FitIterator: %v", err)
