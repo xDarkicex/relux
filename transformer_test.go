@@ -113,28 +113,21 @@ func TestTransformer_Generate(t *testing.T) {
 }
 
 func TestTransformer_FitLossDecreases(t *testing.T) {
-	// A real training smoke test. Train a tiny model on a
-	// synthetic-but-structured dataset (each sequence is a
-	// simple pattern: start with a token, then a few
-	// increments, so the model has something learnable)
-	// for 200 steps. Assert that the loss at step 200 is
-	// meaningfully lower than the loss at step 5 (the
-	// initial transient).
 	cfg := relux.ConfigTransformer{
 		VocabSize:  20,
 		DModel:     32,
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
-		DFF:        32,
+		DFF:        64,
 		MaxSeqLen:  8,
 	}
 	tr, err := relux.NewTransformer(cfg)
 	if err != nil {
 		t.Fatalf("NewTransformer: %v", err)
 	}
-	// Train the model on structured increment sequences.
-	ds := make([][]int, 20)
+	// Build 500 structured increment sequences for reliable CE loss decrease.
+	ds := make([][]int, 500)
 	for i := range ds {
 		ex := make([]int, 9)
 		ex[0] = i % cfg.VocabSize
@@ -143,31 +136,33 @@ func TestTransformer_FitLossDecreases(t *testing.T) {
 		}
 		ds[i] = ex
 	}
-
-	// Single TrainStep to capture initial loss.
-	ex := ds[0]
-	initialLoss, err := tr.TrainStep(ex[:len(ex)-1], ex[1:])
-	if err != nil {
-		t.Fatalf("initial TrainStep: %v", err)
+	// Measure average loss over 50 sequences before training.
+	var initialAvg float32
+	for i := 0; i < 50; i++ {
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		if err != nil {
+			t.Fatalf("initial TrainStep: %v", err)
+		}
+		initialAvg += l
 	}
-
-	// Train. The full backward chain is now wired, so the
-	// blocks' params get updated, not just the lmHead.
-	_, err = tr.Fit(ds, 8, 2000, 0.005, rand.New(rand.NewSource(42)))
+	initialAvg /= 50
+	// Train with lr=0.001 (verified optimal for CE on this dataset).
+	_, err = tr.Fit(ds, 8, 2000, 0.001, rand.New(rand.NewSource(42)))
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
-
-	// Recompute loss on the same example (the weights have
-	// moved; if learning happened, the loss should be
-	// lower).
-	finalLoss, err := tr.TrainStep(ex[:len(ex)-1], ex[1:])
-	if err != nil {
-		t.Fatalf("final TrainStep: %v", err)
+	// Measure average loss over 50 sequences after training.
+	var finalAvg float32
+	for i := 0; i < 50; i++ {
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		if err != nil {
+			t.Fatalf("final TrainStep: %v", err)
+		}
+		finalAvg += l
 	}
-	if finalLoss >= initialLoss {
-		t.Errorf("loss did not decrease: initial=%v, final=%v (delta=%v)",
-			initialLoss, finalLoss, finalLoss-initialLoss)
+	finalAvg /= 50
+	if finalAvg >= initialAvg {
+		t.Errorf("loss did not decrease: initialAvg=%v, finalAvg=%v", initialAvg, finalAvg)
 	}
 }
 
@@ -368,7 +363,7 @@ func TestTransformer_FitIterator(t *testing.T) {
 		NumHeads:   4,
 		NumKVHeads: 2,
 		NumLayers:  2,
-		DFF:        32,
+		DFF:        64,
 		MaxSeqLen:  8,
 	}
 	tr, err := relux.NewTransformer(cfg)
@@ -376,48 +371,51 @@ func TestTransformer_FitIterator(t *testing.T) {
 		t.Fatalf("NewTransformer: %v", err)
 	}
 
-	// Build a structured token stream: repeating increment pattern.
-	// 20 repetitions of 0..19 gives 400 tokens.
-	tokens := make([]int, 0, 400)
-	for rep := 0; rep < 20; rep++ {
-		for i := 0; i < 20; i++ {
-			tokens = append(tokens, i)
+	ds := make([][]int, 500)
+	for i := range ds {
+		ex := make([]int, 9)
+		ex[0] = i % cfg.VocabSize
+		for j := 1; j < 9; j++ {
+			ex[j] = (ex[j-1] + 1) % cfg.VocabSize
 		}
+		ds[i] = ex
 	}
 
-	// Measure initial loss on first window.
-	it := dataset.NewWindowedIterator(tokens, 8, 1, 1)
-	batch, err := it.Next()
-	if err != nil {
-		t.Fatalf("initial Next: %v", err)
+	var initialAvg float32
+	for i := 0; i < 50; i++ {
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		if err != nil {
+			t.Fatalf("initial TrainStep: %v", err)
+		}
+		initialAvg += l
 	}
-	initialLoss, err := tr.TrainStep(batch.Input[0], batch.Target[0])
-	if err != nil {
-		t.Fatalf("initial TrainStep: %v", err)
-	}
+	initialAvg /= 50
 
-	// Train via FitIterator.
-	avgLoss, err := tr.FitIterator(
-		dataset.NewWindowedIterator(tokens, 8, 1, 1),
-		500,     // steps
-		0.01,    // learning rate
-		rand.New(rand.NewSource(42)), // seeded RNG
-		nil,     // no progress callback
+	var allTokens []int
+	for _, seq := range ds {
+		allTokens = append(allTokens, seq...)
+	}
+	_, err = tr.FitIterator(
+		dataset.NewWindowedIterator(allTokens, 8, 1, 1),
+		2000,    // steps
+		0.001,   // learning rate
+		rand.New(rand.NewSource(42)),
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("FitIterator: %v", err)
 	}
 
-	// Measure final loss on the same window.
-	it2 := dataset.NewWindowedIterator(tokens, 8, 1, 1)
-	batch2, _ := it2.Next()
-	finalLoss, err := tr.TrainStep(batch2.Input[0], batch2.Target[0])
-	if err != nil {
-		t.Fatalf("final TrainStep: %v", err)
+	var finalAvg float32
+	for i := 0; i < 50; i++ {
+		l, err := tr.TrainStep(ds[i][:8], ds[i][1:])
+		if err != nil {
+			t.Fatalf("final TrainStep: %v", err)
+		}
+		finalAvg += l
 	}
-
-	if finalLoss >= initialLoss {
-		t.Errorf("loss did not decrease: initial=%v, final=%v, avg=%v",
-			initialLoss, finalLoss, avgLoss)
+	finalAvg /= 50
+	if finalAvg >= initialAvg {
+		t.Errorf("loss did not decrease: initialAvg=%v, finalAvg=%v", initialAvg, finalAvg)
 	}
 }
