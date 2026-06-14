@@ -289,34 +289,9 @@ func (t *Transformer) TrainStep(input, target []int, batchSize int) (float32, er
 	t.setMode(transformer.Train)
 	logits := t.Forward(input, batchSize)
 	logitsData, _ := logits.ToF32()
-	var loss float32
 	totalTokens := batchSize * seq
 	gradOutData := make([]float32, totalTokens*vocab)
-	for i := 0; i < totalTokens; i++ {
-		tgt := target[i]
-		if tgt < 0 || tgt >= vocab {
-			return 0, fmt.Errorf("relux.Transformer.TrainStep: target[%d]=%d out of vocab range", i, tgt)
-		}
-		base := i * vocab
-		maxVal := logitsData[base]
-		for j := 1; j < vocab; j++ {
-			if logitsData[base+j] > maxVal {
-				maxVal = logitsData[base+j]
-			}
-		}
-		var sumExp float32
-		for j := 0; j < vocab; j++ {
-			e := float32(math.Exp(float64(logitsData[base+j] - maxVal)))
-			gradOutData[base+j] = e
-			sumExp += e
-		}
-		invSum := 1.0 / sumExp
-		loss += -float32(math.Log(float64(gradOutData[base+tgt] * invSum)))
-		for j := 0; j < vocab; j++ {
-			gradOutData[base+j] = gradOutData[base+j] * invSum
-		}
-		gradOutData[base+tgt] -= 1.0
-	}
+	loss := softmaxCELossGrad(logitsData, target, vocab, totalTokens, gradOutData)
 	gradOut := transformer.NewTensor(gradOutData, batchSize, seq, vocab)
 
 	// Full backward chain. Embed now outputs [batchSize, seq, dModel]
@@ -337,23 +312,115 @@ func (t *Transformer) EvalStep(input, target []int, batchSize int) float32 {
 	t.setMode(transformer.Inference)
 	logits := t.Forward(input, batchSize)
 	logitsData, _ := logits.ToF32()
-	vocab := t.config.VocabSize
 	totalTokens := batchSize * (len(input) / batchSize)
+	return softmaxCELoss(logitsData, target, t.config.VocabSize, totalTokens)
+}
+
+// fastexp32 computes exp(x) using a pure-float32 bit-level
+// approximation (Schraudolph, 1999). Accurate to ~2% relative
+// error for |x| < 20. Much faster than float64 math.Exp in the
+// hot cross-entropy loop because it avoids the f32→f64→f32
+// conversion chain.
+func fastexp32(x float32) float32 {
+	if x < -87 {
+		return 0
+	}
+	if x > 87 {
+		return math.Float32frombits(0x7F800000) // +Inf
+	}
+	// exp(x) ≈ 2^(x * log2(e))
+	// Multiply by 2^23, add IEEE 754 float32 bias, reinterpret.
+	const factor float32 = float32(1 << 23) / 0.6931471805599453 // 2^23 / ln(2)
+	const bias float32 = 127.0 * float32(1<<23) - 405000          // bias - adjustment
+	return math.Float32frombits(uint32(int32(factor*x + bias)))
+}
+
+// softmaxCELossGrad computes cross-entropy loss and populates
+// gradOut with dL/dlogits = softmax - onehot(target). Returns
+// the sum of cross-entropy loss over all tokens.
+func softmaxCELossGrad(logits []float32, target []int, vocab, totalTokens int, gradOut []float32) float32 {
 	var loss float32
 	for i := 0; i < totalTokens; i++ {
 		tgt := target[i]
 		base := i * vocab
-		maxVal := logitsData[base]
+
+		// Find max logit per token (numerical stability).
+		maxVal := logits[base]
 		for j := 1; j < vocab; j++ {
-			if logitsData[base+j] > maxVal {
-				maxVal = logitsData[base+j]
+			if logits[base+j] > maxVal {
+				maxVal = logits[base+j]
 			}
 		}
+
+		// Single pass: exp + accumulate sum + store for grads.
 		var sumExp float32
 		for j := 0; j < vocab; j++ {
-			sumExp += float32(math.Exp(float64(logitsData[base+j] - maxVal)))
+			diff := logits[base+j] - maxVal
+			var e float32
+			if diff < -20 {
+				e = 0
+			} else {
+				e = fastexp32(diff)
+			}
+			gradOut[base+j] = e
+			sumExp += e
 		}
-		loss += -float32(math.Log(float64(float32(math.Exp(float64(logitsData[base+tgt]-maxVal))) / sumExp)))
+		invSum := float32(1.0) / sumExp
+
+		// Loss: -log(softmax(target)).
+		tgtProb := gradOut[base+tgt] * invSum
+		if tgtProb > 1e-30 {
+			loss += -float32(math.Log(float64(tgtProb)))
+		} else {
+			loss += 30 // cap for numerical safety
+		}
+
+		// Normalize: softmax = exp / sum(exp).
+		for j := 0; j < vocab; j++ {
+			gradOut[base+j] = gradOut[base+j] * invSum
+		}
+		// Subtract one-hot: dL/dlogits = softmax - onehot(target).
+		gradOut[base+tgt] -= 1.0
+	}
+	return loss
+}
+
+// softmaxCELoss computes cross-entropy loss only (no gradient
+// output). Used by EvalStep and validation loops.
+func softmaxCELoss(logits []float32, target []int, vocab, totalTokens int) float32 {
+	var loss float32
+	for i := 0; i < totalTokens; i++ {
+		tgt := target[i]
+		base := i * vocab
+
+		maxVal := logits[base]
+		for j := 1; j < vocab; j++ {
+			if logits[base+j] > maxVal {
+				maxVal = logits[base+j]
+			}
+		}
+
+		var sumExp float32
+		var tgtExp float32
+		for j := 0; j < vocab; j++ {
+			diff := logits[base+j] - maxVal
+			var e float32
+			if diff < -20 {
+				e = 0
+			} else {
+				e = fastexp32(diff)
+			}
+			if j == tgt {
+				tgtExp = e
+			}
+			sumExp += e
+		}
+		prob := tgtExp / sumExp
+		if prob > 1e-30 {
+			loss += -float32(math.Log(float64(prob)))
+		} else {
+			loss += 30
+		}
 	}
 	return loss
 }
