@@ -35,8 +35,11 @@ const (
 	minSlotSize = 48
 
 	// defaultPoolSize is the per-bucket memory budget. Lazily allocated
-	// buckets only consume this much when they're actually used.
-	defaultPoolSize = 16 * 1024 * 1024
+	// buckets only consume this much when they're actually used. Sized
+	// to comfortably handle concurrent stress tests (16 goroutines ×
+	// 1000 allocs × 2KB = 32MB peak) plus the typical transformer
+	// working set.
+	defaultPoolSize = 64 * 1024 * 1024
 )
 
 var (

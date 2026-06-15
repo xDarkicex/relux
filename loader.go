@@ -95,13 +95,43 @@ func installWeightsInto(modelPath, arch string, tr *Transformer, cfg ConfigTrans
 	return fmt.Errorf("loader: unknown format for %s", modelPath)
 }
 
-// detectPublicMapper returns a public-facing mapper. Currently
-// the public package re-uses the internal mappers via a thin shim.
+// detectPublicMapper picks a WeightMapper based on file extension
+// and (for GGUF) the "general.architecture" metadata key, falling
+// back to name heuristics for SafeTensors.
 func detectPublicMapper(path string) loader.WeightMapper {
-	// We don't open the file here; the orchestrator helper does
-	// the heavy lifting. This stub is left in case the public
-	// package wants to expose mapping decisions in the future.
+	if strings.HasSuffix(strings.ToLower(path), ".gguf") {
+		reader, err := loader.NewGGUFReader(path)
+		if err != nil {
+			return nil
+		}
+		defer reader.Close()
+		if arch, ok := reader.Metadata()["general.architecture"].(string); ok && arch != "" {
+			return detectMapperForArch(arch)
+		}
+		// Fall back to name heuristics.
+		return loader.DetectArchitecture(reader.TensorNames())
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".safetensors") {
+		reader, err := loader.NewSafeTensorsReader(path)
+		if err != nil {
+			return nil
+		}
+		defer reader.Close()
+		return loader.DetectArchitecture(reader.TensorNames())
+	}
 	return nil
+}
+
+func detectMapperForArch(arch string) loader.WeightMapper {
+	switch strings.ToLower(arch) {
+	case "llama":
+		return loader.LLaMAMapper{}
+	case "mistral":
+		return loader.MistralMapper{}
+	case "deepseek", "deepseek2":
+		return loader.DeepSeekMapper{}
+	}
+	return loader.LLaMAMapper{}
 }
 
 // installFromSafeTensors handles .safetensors files.
@@ -229,14 +259,21 @@ func writeToParam(
 		if rows*cols != len(f32Buf) {
 			return fmt.Errorf("loader: %s shape %v doesn't match buf %d", mw.Kind, shape, len(f32Buf))
 		}
-		transposed := alloc.Float32(rows * cols)
-		for r := 0; r < rows; r++ {
-			for c := 0; c < cols; c++ {
-				transposed[c*rows+r] = f32Buf[r*cols+c]
+		if rows == cols {
+			// Square matrix: transpose is a no-op (data is row-major,
+			// and the source (out, in) layout equals the dest (in, out)
+			// layout when rows == cols).
+			f32ToBF16(f32Buf, param.Data)
+		} else {
+			transposed := alloc.Float32(rows * cols)
+			for r := 0; r < rows; r++ {
+				for c := 0; c < cols; c++ {
+					transposed[c*rows+r] = f32Buf[r*cols+c]
+				}
 			}
+			f32ToBF16(transposed, param.Data)
+			alloc.Free(transposed)
 		}
-		f32ToBF16(transposed, param.Data)
-		alloc.Free(transposed)
 		return nil
 	}
 	f32ToBF16(f32Buf, param.Data)
@@ -256,11 +293,11 @@ func paramSlot(
 		}
 	case -2:
 		if mw.Kind == "final_norm" {
-			return len(allParams) - 2
+			return len(allParams) - 3
 		}
 	case -3:
 		if mw.Kind == "lm_head" {
-			return len(allParams) - 1
+			return len(allParams) - 2
 		}
 	}
 	if mw.BlockIdx < 0 || mw.BlockIdx >= cfg.NumLayers {
@@ -364,42 +401,6 @@ func f32ToBF16(src []float32, dst []uint16) {
 		u += roundingBias
 		dst[i] = uint16(u >> 16)
 	}
-}
-
-// detectPublicMapperFromPath returns a mapper based on file extension
-// and inferred architecture.
-func detectPublicMapperFromPath(path string) loader.WeightMapper {
-	if strings.HasSuffix(strings.ToLower(path), ".gguf") {
-		reader, err := loader.NewGGUFReader(path)
-		if err != nil {
-			return nil
-		}
-		defer reader.Close()
-		if arch, ok := reader.Metadata()["general.architecture"].(string); ok && arch != "" {
-			return detectMapperForArch(arch)
-		}
-	}
-	if strings.HasSuffix(strings.ToLower(path), ".safetensors") {
-		reader, err := loader.NewSafeTensorsReader(path)
-		if err != nil {
-			return nil
-		}
-		defer reader.Close()
-		return loader.DetectArchitecture(reader.TensorNames())
-	}
-	return nil
-}
-
-func detectMapperForArch(arch string) loader.WeightMapper {
-	switch strings.ToLower(arch) {
-	case "llama":
-		return loader.LLaMAMapper{}
-	case "mistral":
-		return loader.MistralMapper{}
-	case "deepseek", "deepseek2":
-		return loader.DeepSeekMapper{}
-	}
-	return loader.LLaMAMapper{}
 }
 
 // ensure transformer import is used.
