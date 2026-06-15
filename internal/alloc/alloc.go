@@ -134,7 +134,7 @@ func Float64(n int) []float64 {
 			return s
 		}
 	}
-	return make([]float64, n)
+	panic("alloc.Float64: off-heap freelist exhausted")
 }
 
 // ByteSlice returns a byte slice of length n, zero-initialized. See
@@ -180,6 +180,186 @@ func Uint16(n int) []uint16 {
 		}
 	}
 	out := make([]uint16, n)
+	clear(out)
+	return out
+}
+
+// Uint8 returns a uint8 slice of length n, zero-initialized.
+func Uint8(n int) []uint8 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n)
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*uint8)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]uint8, n)
+	clear(out)
+	return out
+}
+
+// Int8 returns an int8 slice of length n, zero-initialized.
+func Int8(n int) []int8 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n)
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*int8)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]int8, n)
+	clear(out)
+	return out
+}
+
+// Uint32 returns a uint32 slice of length n, zero-initialized.
+func Uint32(n int) []uint32 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n) * 4
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*uint32)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]uint32, n)
+	clear(out)
+	return out
+}
+
+// Int32 returns an int32 slice of length n, zero-initialized.
+func Int32(n int) []int32 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n) * 4
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*int32)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	panic("alloc.Int32: off-heap freelist exhausted")
+}
+
+// Int16 returns an int16 slice of length n, zero-initialized.
+func Int16(n int) []int16 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n) * 2
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*int16)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	panic("alloc.Int16: off-heap freelist exhausted")
+}
+
+// Int64 returns an int64 slice of length n, zero-initialized.
+func Int64(n int) []int64 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n) * 8
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*int64)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]int64, n)
+	clear(out)
+	return out
+}
+
+// Uint64 returns a uint64 slice of length n, zero-initialized.
+func Uint64(n int) []uint64 {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n) * 8
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*uint64)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]uint64, n)
+	clear(out)
+	return out
+}
+
+// Bool returns a bool slice of length n, zero-initialized.
+func Bool(n int) []bool {
+	if n <= 0 {
+		return nil
+	}
+	dataBytes := uint64(n)
+	slotSize := bucketFor(uint64(minSlotSize) + dataBytes)
+	fl := getFreelist(slotSize)
+	if fl != nil {
+		if buf, err := fl.Allocate(); err == nil {
+			userOff := uintptr(minSlotSize)
+			userPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + userOff)
+			slotOwner.Store(uintptr(userPtr), slotInfo{fl: fl, slotSize: slotSize, off: userOff})
+			s := unsafe.Slice((*bool)(userPtr), n)
+			clear(s)
+			return s
+		}
+	}
+	out := make([]bool, n)
 	clear(out)
 	return out
 }
